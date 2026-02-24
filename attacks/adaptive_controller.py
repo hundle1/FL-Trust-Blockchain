@@ -1,213 +1,286 @@
 """
-Attack Validation Tests
-Verify that attacks actually work against FedAvg and are mitigated by Trust-Aware
-"""
+Adaptive Attack Controller
+Unified controller for all attack strategies in the FL poisoning experiments.
 
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+Attack Types:
+    - static:       Always attack every round
+    - delayed:      Wait N rounds before attacking (build trust first)
+    - intermittent: Attack with probability p each round
+    - adaptive:     Monitor estimated trust, attack only when safe
+
+Poisoning Methods:
+    - gradient_flip:    Negate and scale the gradient
+    - random_noise:     Add large Gaussian noise
+    - sign_flip:        Flip sign of each element
+    - targeted_scale:   Scale specific layers more aggressively
+"""
 
 import torch
 import numpy as np
-from attacks.adaptive_controller import AdaptiveAttackController
+from typing import Dict, Optional
 
 
-def test_static_attack_always_attacks():
-    """Static attacker should attack every round"""
-    controller = AdaptiveAttackController(
-        client_id=0,
-        attack_type="static",
-        poisoning_scale=5.0
-    )
-    
-    attacks = []
-    for round_num in range(20):
-        decision = controller.should_attack(round_num)
-        attacks.append(decision)
-    
-    attack_rate = sum(attacks) / len(attacks)
-    assert attack_rate == 1.0, f"Static attack should always attack, got {attack_rate}"
-    
-    print(f"✓ Static attack test passed (attack rate = {attack_rate:.2f})")
+class AdaptiveAttackController:
+    """
+    Adaptive Attack Controller
 
+    Manages attack decisions and gradient poisoning for a single malicious client.
+    Supports multiple attack strategies and poisoning methods.
+    Can be configured with knowledge about the trust mechanism.
+    """
 
-def test_delayed_attack():
-    """Delayed attacker should not attack before delay period"""
-    controller = AdaptiveAttackController(
-        client_id=0,
-        attack_type="delayed",
-        poisoning_scale=5.0
-    )
-    controller.delay_rounds = 10
-    
-    early_attacks = [controller.should_attack(r) for r in range(10)]
-    late_attacks = [controller.should_attack(r) for r in range(10, 20)]
-    
-    early_rate = sum(early_attacks) / len(early_attacks)
-    late_rate = sum(late_attacks) / len(late_attacks)
-    
-    assert early_rate == 0.0, f"Should not attack before delay, got {early_rate}"
-    assert late_rate == 1.0, f"Should attack after delay, got {late_rate}"
-    
-    print(f"✓ Delayed attack test passed (early={early_rate:.2f}, late={late_rate:.2f})")
+    def __init__(
+        self,
+        client_id: int,
+        attack_type: str = "static",
+        poisoning_scale: float = 5.0,
+        poison_method: str = "gradient_flip",
+        # Intermittent params
+        attack_frequency: float = 0.3,
+        # Delayed params
+        delay_rounds: int = 15,
+        # Adaptive params
+        trust_threshold: float = 0.7,
+        knows_trust_mechanism: bool = False,
+        knows_alpha: bool = False,
+        alpha_estimate: float = 0.9,
+        objective: str = "maximize_asr",   # maximize_asr | stay_hidden
+        # Dormant params
+        dormant_threshold: float = 0.3,
+    ):
+        """
+        Args:
+            client_id:              Attacker's client ID
+            attack_type:            Strategy: static | delayed | intermittent | adaptive
+            poisoning_scale:        Multiplier for poisoned gradient
+            poison_method:          Poisoning method: gradient_flip | random_noise | sign_flip
+            attack_frequency:       Probability of attack for intermittent strategy
+            delay_rounds:           Rounds to wait before attacking (delayed strategy)
+            trust_threshold:        Threshold above which adaptive attacker attacks
+            knows_trust_mechanism:  Whether attacker knows trust is being tracked
+            knows_alpha:            Whether attacker knows α parameter
+            alpha_estimate:         Attacker's estimate of α (if knows_alpha=True)
+            objective:              Attacker objective
+            dormant_threshold:      Trust below this → enter dormant mode
+        """
+        self.client_id = client_id
+        self.attack_type = attack_type
+        self.poisoning_scale = poisoning_scale
+        self.poison_method = poison_method
 
+        # Intermittent
+        self.attack_frequency = attack_frequency
 
-def test_intermittent_attack_pattern():
-    """Intermittent attacker should attack with specified frequency"""
-    controller = AdaptiveAttackController(
-        client_id=0,
-        attack_type="intermittent",
-        attack_frequency=0.3
-    )
-    
-    attacks = []
-    for round_num in range(100):
-        decision = controller.should_attack(round_num)
-        attacks.append(decision)
-    
-    attack_rate = sum(attacks) / len(attacks)
-    
-    # Should be approximately 0.3 (allow ±0.1 tolerance)
-    assert 0.2 <= attack_rate <= 0.4, f"Expected ~0.3, got {attack_rate}"
-    
-    print(f"✓ Intermittent attack test passed (rate={attack_rate:.2f} ≈ 0.3)")
+        # Delayed
+        self.delay_rounds = delay_rounds
 
+        # Adaptive
+        self.trust_threshold = trust_threshold
+        self.knows_trust_mechanism = knows_trust_mechanism
+        self.knows_alpha = knows_alpha
+        self.alpha_estimate = alpha_estimate
+        self.objective = objective
+        self.dormant_threshold = dormant_threshold
 
-def test_adaptive_attack_trust_awareness():
-    """Adaptive attacker should respond to trust levels"""
-    controller = AdaptiveAttackController(
-        client_id=0,
-        attack_type="adaptive",
-        trust_threshold=0.7,
-        knows_trust_mechanism=True,
-        objective="maximize_asr"
-    )
-    
-    # High trust → should attack
-    high_trust_decision = controller.should_attack(10, estimated_trust=0.9)
-    
-    # Low trust → should NOT attack (dormant)
-    low_trust_decision = controller.should_attack(11, estimated_trust=0.3)
-    
-    assert high_trust_decision == True, "Should attack when trust is high"
-    assert low_trust_decision == False, "Should not attack when trust is low"
-    
-    print("✓ Adaptive trust-aware test passed")
+        # Internal state
+        self.dormant = False
+        self.dormant_since = -1
+        self.recovery_rounds = 10  # rounds to stay dormant before recovery
 
+        # Statistics
+        self.total_rounds = 0
+        self.total_attacks = 0
+        self.attack_history: list = []    # True/False per round
+        self.trust_history: list = []     # estimated trust per round
 
-def test_gradient_poisoning():
-    """Test gradient poisoning methods"""
-    controller = AdaptiveAttackController(client_id=0, poisoning_scale=5.0)
-    
-    # Clean gradient
-    clean_grad = {
-        'param1': torch.tensor([1.0, 2.0, 3.0]),
-        'param2': torch.tensor([0.5, -0.5])
-    }
-    
-    # Test gradient flip
-    poisoned = controller.poison_gradient(clean_grad, poison_method="gradient_flip")
-    
-    # Should be negated and scaled
-    expected_param1 = -5.0 * clean_grad['param1']
-    
-    assert torch.allclose(poisoned['param1'], expected_param1), "Gradient flip failed"
-    
-    print("✓ Gradient poisoning test passed")
+    # ------------------------------------------------------------------
+    # Attack decision
+    # ------------------------------------------------------------------
 
+    def should_attack(self, round_num: int, estimated_trust: float = 1.0) -> bool:
+        """
+        Decide whether to attack in this round.
 
-def test_attack_statistics():
-    """Test attack statistics tracking"""
-    controller = AdaptiveAttackController(
-        client_id=0,
-        attack_type="intermittent",
-        attack_frequency=0.5
-    )
-    
-    for round_num in range(50):
-        controller.should_attack(round_num)
-    
-    stats = controller.get_statistics()
-    
-    assert 'total_attacks' in stats
-    assert 'attack_rate' in stats
-    assert 'attack_history' in stats
-    
-    expected_attacks = 50 * 0.5
-    assert abs(stats['total_attacks'] - expected_attacks) < 15, \
-        f"Expected ~{expected_attacks} attacks, got {stats['total_attacks']}"
-    
-    print(f"✓ Statistics test passed (attacks={stats['total_attacks']}, rate={stats['attack_rate']:.2f})")
+        Args:
+            round_num:       Current training round
+            estimated_trust: Attacker's estimate of its own trust score
 
+        Returns:
+            attack: True if should attack
+        """
+        self.total_rounds += 1
+        self.trust_history.append(estimated_trust)
 
-def test_attacker_with_alpha_knowledge():
-    """Test that attacker with α knowledge behaves differently"""
-    # Attacker knows α
-    controller_knows = AdaptiveAttackController(
-        client_id=0,
-        attack_type="adaptive",
-        knows_alpha=True,
-        alpha_estimate=0.9
-    )
-    
-    # Attacker doesn't know α
-    controller_blind = AdaptiveAttackController(
-        client_id=1,
-        attack_type="adaptive",
-        knows_alpha=False
-    )
-    
-    # Both should still make decisions, but strategy differs
-    decision_knows = controller_knows.should_attack(10, 0.8)
-    decision_blind = controller_blind.should_attack(10, 0.8)
-    
-    print(f"✓ Alpha knowledge test passed (knows={decision_knows}, blind={decision_blind})")
+        if self.attack_type == "static":
+            decision = self._static_decision()
 
+        elif self.attack_type == "delayed":
+            decision = self._delayed_decision(round_num)
 
-def test_dormant_phase():
-    """Test that attacker enters dormant phase when trust drops"""
-    controller = AdaptiveAttackController(
-        client_id=0,
-        attack_type="adaptive",
-        knows_trust_mechanism=True,
-        objective="maximize_asr"
-    )
-    
-    # Simulate trust dropping below critical threshold
-    controller.should_attack(10, estimated_trust=0.2)
-    
-    assert controller.dormant == True, "Should enter dormant phase"
-    
-    print("✓ Dormant phase test passed")
+        elif self.attack_type == "intermittent":
+            decision = self._intermittent_decision(round_num)
 
+        elif self.attack_type == "adaptive":
+            decision = self._adaptive_decision(round_num, estimated_trust)
 
-def run_all_tests():
-    """Run all attack validation tests"""
-    print("\n" + "="*70)
-    print("ATTACK VALIDATION TESTS")
-    print("="*70 + "\n")
-    
-    test_static_attack_always_attacks()
-    test_delayed_attack()
-    test_intermittent_attack_pattern()
-    test_adaptive_attack_trust_awareness()
-    test_gradient_poisoning()
-    test_attack_statistics()
-    test_attacker_with_alpha_knowledge()
-    test_dormant_phase()
-    
-    print("\n" + "="*70)
-    print("ALL ATTACK TESTS PASSED ✓")
-    print("="*70)
-    print("\nKey Validations:")
-    print("  ✓ Static attacks work consistently")
-    print("  ✓ Delayed attacks respect timing")
-    print("  ✓ Intermittent attacks follow probability")
-    print("  ✓ Adaptive attacks respond to trust")
-    print("  ✓ Poisoning methods modify gradients correctly")
+        else:
+            decision = self._static_decision()
 
+        self.attack_history.append(decision)
+        if decision:
+            self.total_attacks += 1
 
-if __name__ == "__main__":
-    torch.manual_seed(42)
-    np.random.seed(42)
-    run_all_tests()
+        return decision
+
+    def _static_decision(self) -> bool:
+        """Always attack."""
+        return True
+
+    def _delayed_decision(self, round_num: int) -> bool:
+        """Attack only after delay_rounds have passed."""
+        return round_num >= self.delay_rounds
+
+    def _intermittent_decision(self, round_num: int) -> bool:
+        """Attack randomly with probability attack_frequency."""
+        return np.random.random() < self.attack_frequency
+
+    def _adaptive_decision(self, round_num: int, estimated_trust: float) -> bool:
+        """
+        Adaptive strategy that responds to estimated trust level.
+
+        If knows_trust_mechanism:
+            - Stay dormant when trust is low (to recover)
+            - Attack aggressively when trust is high
+        Else:
+            - Simple threshold check
+        """
+        # Check if entering / maintaining dormant phase
+        if estimated_trust < self.dormant_threshold:
+            if not self.dormant:
+                self.dormant = True
+                self.dormant_since = round_num
+            return False
+
+        # Recovery: stay dormant for recovery_rounds after trust drops
+        if self.dormant:
+            rounds_dormant = round_num - self.dormant_since
+            if rounds_dormant < self.recovery_rounds:
+                return False
+            else:
+                # Enough time has passed, try to recover
+                self.dormant = False
+
+        if self.knows_trust_mechanism:
+            if self.objective == "stay_hidden":
+                # Only attack if trust is very high (minimize detection risk)
+                return estimated_trust > 0.85
+            else:  # maximize_asr
+                # Attack whenever trust is safely above threshold
+                return estimated_trust > self.trust_threshold
+        else:
+            # Blind attacker: just check threshold
+            return estimated_trust > self.trust_threshold
+
+    # ------------------------------------------------------------------
+    # Gradient poisoning
+    # ------------------------------------------------------------------
+
+    def poison_gradient(
+        self,
+        clean_gradient: Dict[str, torch.Tensor],
+        poison_method: Optional[str] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Apply poisoning to a clean gradient.
+
+        Args:
+            clean_gradient: Client's genuine model update
+            poison_method:  Override instance's default method if provided
+
+        Returns:
+            poisoned_gradient: Modified gradient
+        """
+        method = poison_method or self.poison_method
+
+        if method == "gradient_flip":
+            return self._gradient_flip(clean_gradient)
+        elif method == "random_noise":
+            return self._random_noise(clean_gradient)
+        elif method == "sign_flip":
+            return self._sign_flip(clean_gradient)
+        elif method == "targeted_scale":
+            return self._targeted_scale(clean_gradient)
+        else:
+            return self._gradient_flip(clean_gradient)
+
+    def _gradient_flip(self, gradient: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Negate gradient and multiply by poisoning_scale."""
+        return {name: -self.poisoning_scale * param for name, param in gradient.items()}
+
+    def _random_noise(self, gradient: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Replace gradient with large random noise."""
+        poisoned = {}
+        for name, param in gradient.items():
+            noise = torch.randn_like(param)
+            poisoned[name] = self.poisoning_scale * noise
+        return poisoned
+
+    def _sign_flip(self, gradient: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Flip the sign of each element (magnitude preserved, direction reversed)."""
+        return {name: -param * self.poisoning_scale for name, param in gradient.items()}
+
+    def _targeted_scale(self, gradient: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Aggressively scale specific layers (last layers get higher scale).
+        Designed to corrupt decision boundaries while being harder to detect.
+        """
+        poisoned = {}
+        param_names = list(gradient.keys())
+        n = len(param_names)
+
+        for i, name in enumerate(param_names):
+            # Scale increases for later layers
+            layer_scale = self.poisoning_scale * (1.0 + i / max(1, n - 1))
+            poisoned[name] = -layer_scale * gradient[name]
+
+        return poisoned
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
+
+    def get_statistics(self) -> Dict:
+        """Return attack statistics."""
+        attack_rate = self.total_attacks / max(1, self.total_rounds)
+
+        avg_trust_when_attacking = 0.0
+        if self.attack_history and self.trust_history:
+            attacked_trusts = [
+                self.trust_history[i]
+                for i, attacked in enumerate(self.attack_history)
+                if attacked and i < len(self.trust_history)
+            ]
+            if attacked_trusts:
+                avg_trust_when_attacking = float(np.mean(attacked_trusts))
+
+        return {
+            'client_id': self.client_id,
+            'attack_type': self.attack_type,
+            'poison_method': self.poison_method,
+            'total_rounds': self.total_rounds,
+            'total_attacks': self.total_attacks,
+            'attack_rate': attack_rate,
+            'dormant': self.dormant,
+            'attack_history': self.attack_history,
+            'trust_history': self.trust_history,
+            'avg_trust_when_attacking': avg_trust_when_attacking
+        }
+
+    def reset(self):
+        """Reset attack controller state."""
+        self.dormant = False
+        self.dormant_since = -1
+        self.total_rounds = 0
+        self.total_attacks = 0
+        self.attack_history = []
+        self.trust_history = []
