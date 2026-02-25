@@ -23,11 +23,9 @@ class Block:
             'data': str(self.data),
             'previous_hash': self.previous_hash
         }, sort_keys=True)
-        
         return hashlib.sha256(block_string.encode()).hexdigest()
     
     def to_dict(self) -> Dict:
-        """Convert block to dictionary"""
         return {
             'index': self.index,
             'timestamp': self.timestamp,
@@ -40,20 +38,23 @@ class Block:
 class MockBlockchain:
     """
     Mock Blockchain for Audit Logging
-    Simulates blockchain overhead without real consensus
+    Simulates blockchain overhead without real consensus.
+
+    NOTE: Default block_time is 0.05s (simulation).
+    Original value was 5.0s which caused 250s overhead for 50-round experiments.
     """
     
     def __init__(
         self,
-        consensus_latency: float = 0.1,
-        block_time: float = 5.0,
+        consensus_latency: float = 0.001,   # latency per transaction
+        block_time: float = 0.05,            # FIX: was 5.0 → too slow for experiments
         track_storage: bool = True
     ):
         """
         Args:
-            consensus_latency: Simulated consensus delay (seconds)
-            block_time: Time to create new block (seconds)
-            track_storage: Whether to track storage overhead
+            consensus_latency: Simulated consensus delay per write (seconds)
+            block_time:        Simulated block mining time (seconds)
+            track_storage:     Whether to track storage overhead
         """
         self.chain: List[Block] = []
         self.pending_transactions: List[Dict] = []
@@ -61,19 +62,17 @@ class MockBlockchain:
         self.block_time = block_time
         self.track_storage = track_storage
         
-        # Metrics
+        # Overhead metrics
         self.total_write_time = 0.0
         self.total_read_time = 0.0
         self.total_storage_bytes = 0
         
-        # Create genesis block
         self._create_genesis_block()
     
     def _create_genesis_block(self):
-        """Create the first block in the chain"""
-        genesis_block = Block(0, time.time(), {"message": "Genesis Block"}, "0")
-        self.chain.append(genesis_block)
-        self._update_storage(genesis_block)
+        genesis = Block(0, time.time(), {"message": "Genesis Block"}, "0")
+        self.chain.append(genesis)
+        self._update_storage(genesis)
     
     def add_transaction(self, transaction: Dict):
         """Add transaction to pending pool"""
@@ -86,33 +85,18 @@ class MockBlockchain:
         trust_score: float,
         metrics: Dict[str, float]
     ):
-        """
-        Log client update to blockchain
-        
-        Args:
-            round_num: Current round number
-            client_id: Client ID
-            trust_score: Current trust score
-            metrics: Training metrics
-        """
+        """Log client update event"""
         start_time = time.time()
-        
-        transaction = {
+        self.add_transaction({
             'type': 'client_update',
             'round': round_num,
             'client_id': client_id,
             'trust_score': trust_score,
             'metrics': metrics,
             'timestamp': datetime.now().isoformat()
-        }
-        
-        self.add_transaction(transaction)
-        
-        # Simulate consensus latency
+        })
         time.sleep(self.consensus_latency)
-        
-        write_time = time.time() - start_time
-        self.total_write_time += write_time
+        self.total_write_time += time.time() - start_time
     
     def log_aggregation(
         self,
@@ -123,21 +107,16 @@ class MockBlockchain:
     ):
         """Log aggregation results"""
         start_time = time.time()
-        
-        transaction = {
+        self.add_transaction({
             'type': 'aggregation',
             'round': round_num,
             'selected_clients': selected_clients,
             'aggregation_method': aggregation_method,
             'global_metrics': global_metrics,
             'timestamp': datetime.now().isoformat()
-        }
-        
-        self.add_transaction(transaction)
+        })
         time.sleep(self.consensus_latency)
-        
-        write_time = time.time() - start_time
-        self.total_write_time += write_time
+        self.total_write_time += time.time() - start_time
     
     def log_attack_flag(
         self,
@@ -146,23 +125,18 @@ class MockBlockchain:
         reason: str,
         trust_score: float
     ):
-        """Log detected anomaly/attack"""
+        """Log detected anomaly / attack flag"""
         start_time = time.time()
-        
-        transaction = {
+        self.add_transaction({
             'type': 'attack_flag',
             'round': round_num,
             'client_id': client_id,
             'reason': reason,
             'trust_score': trust_score,
             'timestamp': datetime.now().isoformat()
-        }
-        
-        self.add_transaction(transaction)
+        })
         time.sleep(self.consensus_latency)
-        
-        write_time = time.time() - start_time
-        self.total_write_time += write_time
+        self.total_write_time += time.time() - start_time
     
     def create_block(self) -> Optional[Block]:
         """Create new block from pending transactions"""
@@ -179,76 +153,54 @@ class MockBlockchain:
             previous_hash=previous_block.hash
         )
         
-        # Simulate block creation time
-        time.sleep(self.block_time)
+        time.sleep(self.block_time)   # simulate block mining
         
         self.chain.append(new_block)
         self.pending_transactions = []
-        
         self._update_storage(new_block)
         
-        write_time = time.time() - start_time
-        self.total_write_time += write_time
-        
+        self.total_write_time += time.time() - start_time
         return new_block
     
     def _update_storage(self, block: Block):
-        """Update storage metrics"""
         if self.track_storage:
             block_json = json.dumps(block.to_dict())
-            block_size = len(block_json.encode('utf-8'))
-            self.total_storage_bytes += block_size
+            self.total_storage_bytes += len(block_json.encode('utf-8'))
     
     def get_client_history(self, client_id: int) -> List[Dict]:
-        """Retrieve all transactions for a specific client"""
         start_time = time.time()
-        
         history = []
         for block in self.chain:
             if 'transactions' in block.data:
                 for tx in block.data['transactions']:
                     if tx.get('client_id') == client_id:
                         history.append(tx)
-        
-        read_time = time.time() - start_time
-        self.total_read_time += read_time
-        
+        self.total_read_time += time.time() - start_time
         return history
     
     def get_round_data(self, round_num: int) -> List[Dict]:
-        """Retrieve all transactions for a specific round"""
         start_time = time.time()
-        
-        round_data = []
+        data = []
         for block in self.chain:
             if 'transactions' in block.data:
                 for tx in block.data['transactions']:
                     if tx.get('round') == round_num:
-                        round_data.append(tx)
-        
-        read_time = time.time() - start_time
-        self.total_read_time += read_time
-        
-        return round_data
+                        data.append(tx)
+        self.total_read_time += time.time() - start_time
+        return data
     
     def verify_chain(self) -> bool:
         """Verify blockchain integrity"""
         for i in range(1, len(self.chain)):
-            current_block = self.chain[i]
-            previous_block = self.chain[i - 1]
-            
-            # Check hash
-            if current_block.hash != current_block.calculate_hash():
+            cur = self.chain[i]
+            prev = self.chain[i - 1]
+            if cur.hash != cur.calculate_hash():
                 return False
-            
-            # Check previous hash link
-            if current_block.previous_hash != previous_block.hash:
+            if cur.previous_hash != prev.hash:
                 return False
-        
         return True
     
     def get_overhead_metrics(self) -> Dict[str, Any]:
-        """Get blockchain overhead metrics"""
         return {
             'total_blocks': len(self.chain),
             'total_write_time': self.total_write_time,
@@ -259,7 +211,6 @@ class MockBlockchain:
         }
     
     def get_chain_summary(self) -> Dict:
-        """Get summary of blockchain state"""
         return {
             'chain_length': len(self.chain),
             'pending_transactions': len(self.pending_transactions),

@@ -1,6 +1,6 @@
 """
 Intermittent Poisoning Attack
-Attacker attacks randomly with certain probability
+Attacker attacks randomly with certain probability per round.
 """
 
 import torch
@@ -10,7 +10,8 @@ from typing import Dict
 
 class IntermittentPoisoningAttack:
     """
-    Intermittent attack: attack with probability p in each round
+    Intermittent attack: attack with probability p in each round.
+    Supports random, periodic, and burst patterns.
     """
     
     def __init__(
@@ -18,15 +19,8 @@ class IntermittentPoisoningAttack:
         client_id: int,
         attack_probability: float = 0.3,
         poisoning_scale: float = 5.0,
-        pattern: str = "random"
+        pattern: str = "random"   # random | periodic | burst
     ):
-        """
-        Args:
-            client_id: Attacker's client ID
-            attack_probability: Probability of attacking in each round
-            poisoning_scale: Scale factor for poisoning
-            pattern: Attack pattern (random, periodic, burst)
-        """
         self.client_id = client_id
         self.attack_probability = attack_probability
         self.poisoning_scale = poisoning_scale
@@ -37,79 +31,44 @@ class IntermittentPoisoningAttack:
         self.attack_history = []
     
     def should_attack(self, round_num: int) -> bool:
-        """
-        Decide whether to attack this round
-        
-        Args:
-            round_num: Current round number
-            
-        Returns:
-            attack: True if should attack
-        """
         self.current_round = round_num
         
         if self.pattern == "random":
-            # Random attack with fixed probability
             attack = np.random.random() < self.attack_probability
         
         elif self.pattern == "periodic":
-            # Attack every N rounds
-            period = int(1 / self.attack_probability)
+            period = int(1 / max(1e-6, self.attack_probability))
             attack = (round_num % period) == 0
         
         elif self.pattern == "burst":
-            # Attack in bursts: 3 consecutive rounds, then idle
+            # Attack in bursts of 3, then rest
             burst_length = 3
-            period = int(burst_length / self.attack_probability)
-            position_in_period = round_num % period
-            attack = position_in_period < burst_length
+            period = int(burst_length / max(1e-6, self.attack_probability))
+            attack = (round_num % period) < burst_length
         
         else:
-            # Default: random
             attack = np.random.random() < self.attack_probability
         
         self.attack_history.append(attack)
-        
         if attack:
             self.attacks_executed += 1
-        
         return attack
     
     def poison_gradient(self, clean_gradient: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Apply poisoning to gradient
-        
-        Args:
-            clean_gradient: Clean gradient
-            
-        Returns:
-            poisoned_gradient: Poisoned gradient
-        """
-        poisoned = {}
-        
-        for name, param in clean_gradient.items():
-            # Flip and scale
-            poisoned[name] = -self.poisoning_scale * param
-        
-        return poisoned
+        return {name: -self.poisoning_scale * param for name, param in clean_gradient.items()}
     
     def get_statistics(self) -> dict:
-        """Get attack statistics"""
         total_rounds = len(self.attack_history)
         attack_rate = self.attacks_executed / total_rounds if total_rounds > 0 else 0.0
         
-        # Calculate burstiness
-        if len(self.attack_history) > 1:
-            consecutive_attacks = 0
-            max_consecutive = 0
-            for attacked in self.attack_history:
-                if attacked:
-                    consecutive_attacks += 1
-                    max_consecutive = max(max_consecutive, consecutive_attacks)
-                else:
-                    consecutive_attacks = 0
-        else:
-            max_consecutive = 0
+        max_consecutive = 0
+        consecutive = 0
+        for a in self.attack_history:
+            if a:
+                consecutive += 1
+                max_consecutive = max(max_consecutive, consecutive)
+            else:
+                consecutive = 0
         
         return {
             'type': 'intermittent',
