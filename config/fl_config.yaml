@@ -1,0 +1,45 @@
+# Federated Learning Configuration
+# ===================================
+
+fl:
+  # Experiment scale
+  num_clients: 100
+  clients_per_round: 10
+  num_rounds: 100
+
+  # Local training
+  local_epochs: 5
+  batch_size: 32
+  learning_rate: 0.01
+  momentum: 0.9
+  optimizer: "sgd"
+
+  # Data
+  dataset: "mnist" # mnist | cifar10 | femnist
+  data_dir: "./data"
+  iid: true # IID or non-IID data partitioning
+  samples_per_client: 600
+
+  # Device
+  device: "cpu" # cpu | cuda
+
+  # Reproducibility
+  seed: 42
+
+aggregation:
+  method: "trust_aware" # fedavg | trust_aware | krum | trimmed_mean
+  # Krum
+  krum_num_malicious: 20 # estimated number of malicious clients
+  # Trimmed mean
+  trim_ratio: 0.1 # fraction to trim from each end
+
+evaluation:
+  convergence_threshold: 0.90 # accuracy threshold for convergence check
+  convergence_window: 5 # consecutive rounds above threshold
+  eval_every: 1 # evaluate every N rounds
+
+logging:
+  log_dir: "./results"
+  save_figures: true
+  figure_dir: "./results/figures"
+  verbose: true

@@ -1,0 +1,43 @@
+# Attack Configuration
+# ===================================
+
+attack:
+  # Attack rate (fraction of malicious clients)
+  attack_rate: 0.2 # 20% malicious clients (default)
+  attack_rate_range: [0.1, 0.2, 0.3, 0.4, 0.5]
+
+  # Poisoning
+  poisoning_scale: 5.0 # Gradient flip scale factor
+  poison_method: "gradient_flip" # gradient_flip | random_noise | sign_flip | targeted_scale
+
+  # ---- Static attack ----
+  static:
+    always_attack: true
+
+  # ---- Delayed attack ----
+  delayed:
+    delay_rounds: 15 # warm-up rounds before attacking
+    attack_after_delay: "always" # always | intermittent
+    attack_probability: 1.0
+    smart_timing: true
+
+  # ---- Intermittent attack ----
+  intermittent:
+    attack_probability: 0.3
+    pattern: "random" # random | periodic | burst
+
+  # ---- Adaptive attack ----
+  adaptive:
+    trust_threshold: 0.7 # attack only if trust > this
+    dormant_threshold: 0.3 # enter dormant phase if trust < this
+    recovery_rounds: 10 # rounds to stay dormant
+    knows_trust_mechanism: true # does attacker know trust is tracked?
+    knows_alpha: false
+    alpha_estimate: 0.9
+    objective: "maximize_asr" # maximize_asr | stay_hidden
+
+  # ---- Norm-tuned (stealthy) attack ----
+  norm_tuned:
+    target_norm_ratio: 1.5 # target attack_norm / benign_norm
+    base_poisoning_scale: 5.0
+    adaptive: true

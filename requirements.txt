@@ -1,0 +1,20 @@
+# Trust-Aware Federated Learning + Blockchain
+# Python 3.8+
+
+# Deep learning
+torch>=1.13.0
+torchvision>=0.14.0
+
+# Scientific computing
+numpy>=1.21.0
+scipy>=1.7.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.2
+
+# Progress bars
+tqdm>=4.62.0
+
+# Config
+pyyaml>=5.4.1

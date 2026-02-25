@@ -62,8 +62,7 @@ def run_overhead_experiment(use_blockchain, num_rounds=50):
             client_ids.append(client.client_id)
             metrics_list.append(met)
             if blockchain:
-                blockchain.log_client_update(round_num, client.client_id,
-                                             trust_manager.get_trust_score(client.client_id), met)
+                blockchain.log_client_update(round_num, client.client_id,trust_manager.get_trust_score(client.client_id), met)
 
         ref = {k: torch.mean(torch.stack([u[k] for u in updates]), dim=0) for k in updates[0]}
         for i, cid in enumerate(client_ids):
@@ -136,8 +135,8 @@ def main():
     axes[1,0].grid(True, alpha=0.3)
 
     axes[1,1].bar(['Time\nOverhead (s)', 'Storage\n(KB)'],
-                  [r_bc['total_time']-r_no['total_time'], total_storage],
-                  color=['coral', 'lightgreen'], alpha=0.8)
+                [r_bc['total_time']-r_no['total_time'], total_storage],
+                color=['coral', 'lightgreen'], alpha=0.8)
     axes[1,1].set(title='Overhead Summary'); axes[1,1].grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()

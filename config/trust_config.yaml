@@ -1,0 +1,37 @@
+# Trust Score Configuration
+# ===================================
+
+trust:
+  # Core parameters
+  alpha:
+    0.9 # EMA decay factor (0~1). Higher = slower trust change
+    # Sensitivity analysis: [0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
+  tau:
+    0.3 # Trust threshold for filtering (clients below = excluded)
+    # Sensitivity analysis: [0.1, 0.2, 0.3, 0.4, 0.5]
+
+  # Initial trust
+  initial_trust: 1.0 # All clients start with max trust
+
+  # Decay settings
+  enable_decay: true
+  decay_strategy: "exponential" # exponential | threshold | adaptive
+  idle_decay_rate: 0.005 # Trust decay per round for idle clients
+
+  # History window
+  window_size: 10 # Rounds of behavior history to maintain
+
+  # Bounds
+  min_trust: 0.0
+  max_trust: 1.0
+
+  # Composite scoring weights
+  similarity_weight: 0.8 # Weight of cosine similarity in trust update
+  loss_weight: 0.2 # Weight of loss-based signal
+
+  # Filtering
+  enable_filtering: true # Exclude clients below tau from aggregation
+
+  # Alpha sensitivity study range
+  alpha_range: [0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
+  tau_range: [0.1, 0.2, 0.3, 0.4, 0.5]

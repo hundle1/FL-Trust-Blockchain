@@ -1,0 +1,41 @@
+# Blockchain Configuration
+# ===================================
+
+blockchain:
+  # Enable/disable blockchain logging
+  enabled: true
+
+  # Mock blockchain parameters
+  mock:
+    consensus_latency: 0.001 # simulated consensus delay (seconds)
+    block_time: 0.05 # simulated block creation time (seconds)
+    track_storage: true
+
+  # Block creation
+  transactions_per_block: 10 # create block every N transactions
+  block_every_n_rounds: 5 # create block every N training rounds
+
+  # What to log
+  log_client_updates: true
+  log_aggregation: true
+  log_trust_updates: true
+  log_attack_flags: true
+  log_model_checkpoints: false # disabled by default (large)
+
+  # Smart contract thresholds
+  smart_contract:
+    enabled: true
+    penalty_threshold: 0.2 # trigger penalty if trust < this
+    reward_threshold: 0.8 # trigger reward if trust > this
+    auto_execute: false # auto-execute contract actions
+
+  # Audit log
+  audit:
+    enabled: true
+    log_file: "./results/audit_log.jsonl"
+    export_report: true
+    report_file: "./results/audit_report.txt"
+
+  # Overhead measurement
+  measure_overhead: true
+  overhead_output: "./results/blockchain_overhead.json"
