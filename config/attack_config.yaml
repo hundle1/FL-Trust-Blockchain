@@ -7,7 +7,7 @@ attack:
   attack_rate_range: [0.1, 0.2, 0.3, 0.4, 0.5]
 
   # Poisoning
-  poisoning_scale: 5.0 # Gradient flip scale factor
+  poisoning_scale: 2.0 # Gradient flip scale factor
   poison_method: "gradient_flip" # gradient_flip | random_noise | sign_flip | targeted_scale
 
   # ---- Static attack ----
