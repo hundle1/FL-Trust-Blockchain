@@ -1,14 +1,14 @@
-# Attack Configuration
+# Attack Configuration — STRONGER VERSION
 # ===================================
 
 attack:
   # Attack rate (fraction of malicious clients)
-  attack_rate: 0.2 # 20% malicious clients (default)
+  attack_rate: 0.30 # STRONGER: was 0.20 — 30% breaks Krum's n>2f+2 guarantee
   attack_rate_range: [0.1, 0.2, 0.3, 0.4, 0.5]
 
   # Poisoning
-  poisoning_scale: 2.0 # Gradient flip scale factor
-  poison_method: "gradient_flip" # gradient_flip | random_noise | sign_flip | targeted_scale
+  poisoning_scale: 15.0 # STRONGER: was 2.0 (was 5.0 in code)
+  poison_method: "gradient_flip" # gradient_flip | lie | inner_product | min_max | targeted_scale
 
   # ---- Static attack ----
   static:
@@ -16,28 +16,41 @@ attack:
 
   # ---- Delayed attack ----
   delayed:
-    delay_rounds: 15 # warm-up rounds before attacking
-    attack_after_delay: "always" # always | intermittent
+    delay_rounds: 10 # STRONGER: was 15 (shorter warm-up → attacks earlier)
+    attack_after_delay: "always"
     attack_probability: 1.0
     smart_timing: true
 
   # ---- Intermittent attack ----
   intermittent:
-    attack_probability: 0.3
-    pattern: "random" # random | periodic | burst
+    attack_probability: 0.50 # STRONGER: was 0.30
+    pattern: "burst" # STRONGER: burst pattern maximizes local impact
 
   # ---- Adaptive attack ----
   adaptive:
-    trust_threshold: 0.7 # attack only if trust > this
-    dormant_threshold: 0.3 # enter dormant phase if trust < this
-    recovery_rounds: 10 # rounds to stay dormant
-    knows_trust_mechanism: true # does attacker know trust is tracked?
+    trust_threshold: 0.55 # STRONGER: was 0.7 — attacks at lower trust
+    dormant_threshold: 0.25 # STRONGER: was 0.3
+    recovery_rounds: 5 # STRONGER: was 10 — faster recovery
+    knows_trust_mechanism: true
     knows_alpha: false
     alpha_estimate: 0.9
-    objective: "maximize_asr" # maximize_asr | stay_hidden
+    objective: "maximize_asr"
+
+  # ---- LIE (Little Is Enough) attack — NEW ----
+  lie:
+    # Uses z-score bounds to craft updates that bypass Byzantine aggregators
+    z_scale: 1.5 # z_max parameter for crafting adversarial perturbation
+
+  # ---- IPM (Inner Product Manipulation) attack — NEW ----
+  inner_product:
+    epsilon_multiplier: 1.5 # epsilon = n_attackers * multiplier
+
+  # ---- Min-Max attack — NEW ----
+  min_max:
+    deviation_multiplier: 3.0 # How far to deviate from mean direction
 
   # ---- Norm-tuned (stealthy) attack ----
   norm_tuned:
-    target_norm_ratio: 1.5 # target attack_norm / benign_norm
-    base_poisoning_scale: 5.0
+    target_norm_ratio: 3.0 # STRONGER: was 1.5 (3x benign norm)
+    base_poisoning_scale: 15.0
     adaptive: true
