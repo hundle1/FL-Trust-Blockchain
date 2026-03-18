@@ -63,8 +63,9 @@ SIM_WEIGHT         = 0.7    # giảm từ 0.9: trust không bị dominated bởi
 NORM_PENALTY_THRESHOLD = 1.5   # bắt đầu phạt khi norm_ratio > 1.5x median
 NORM_PENALTY_STRENGTH  = 0.85  # hệ số giảm trust mỗi round bị phát hiện norm bất thường
 
-ENABLE_NORM_CLIP   = True
-CLIP_MULTIPLIER    = 2.0
+ENABLE_NORM_CLIP        = True
+CLIP_MULTIPLIER         = 1.5   
+WARMUP_CLIP_MULTIPLIER  = 1.2
 
 ATTACK_ORDER = ["no_attack", "static", "delayed", "adaptive", "intermittent", "norm_tuned"]
 
@@ -237,9 +238,6 @@ def run_scenario(
     num_rounds: int = NUM_ROUNDS,
 ) -> Dict:
     model = get_model().to(DEVICE)
-    if DEVICE.type == 'cuda':
-        # Tối ưu hóa cho kiến trúc Blackwell
-        model = torch.compile(model)
     trust_manager = TrustScoreManager(
         num_clients             = NUM_CLIENTS,
         alpha                   = ALPHA,
@@ -257,11 +255,13 @@ def run_scenario(
     )
     aggregator = TrustAwareAggregator(
         trust_manager,
-        enable_filtering       = True,   # core defense: filter malicious clients
-        enable_norm_clip       = ENABLE_NORM_CLIP,
-        clip_multiplier        = CLIP_MULTIPLIER,
-        use_median             = False,  # Option A: filtering ON, median OFF — tránh over-defense stacking
-        min_trusted_for_median = 2,
+        enable_filtering        = True,
+        enable_norm_clip        = ENABLE_NORM_CLIP,
+        clip_multiplier         = CLIP_MULTIPLIER,
+        warmup_clip_multiplier  = WARMUP_CLIP_MULTIPLIER,  # thêm dòng này
+        warmup_rounds           = WARMUP_ROUNDS,            # thêm dòng này
+        use_median              = False,
+        min_trusted_for_median  = 2,
     )
 
     clients = [
@@ -297,11 +297,7 @@ def run_scenario(
         selected_idx = np.random.choice(NUM_CLIENTS, CLIENTS_PER_ROUND, replace=False)
         selected     = [clients[i] for i in selected_idx]
 
-        if hasattr(model, '_orig_mod'):
-            # Nếu model đã bị torch.compile, ta lấy model gốc bên trong
-            global_params = {n: p.data.clone().to(DEVICE) for n, p in model._orig_mod.named_parameters()}
-        else:
-            global_params = {n: p.data.clone().to(DEVICE) for n, p in model.named_parameters()}
+        global_params = {n: p.data.clone().to(DEVICE) for n, p in model.named_parameters()}
         for c in selected:
             c.set_parameters(global_params)
 

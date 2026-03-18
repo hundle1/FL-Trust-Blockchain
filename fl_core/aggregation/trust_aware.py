@@ -128,9 +128,11 @@ class TrustAwareAggregator:
         trust_manager,
         enable_filtering: bool = True,
         enable_norm_clip: bool = True,
-        clip_multiplier: float = 2.5,
-        use_median: bool = True,              # FIX 4: dùng median thay weighted mean
-        min_trusted_for_median: int = 2,      # fallback sang mean nếu < N trusted
+        clip_multiplier: float = 1.5,        # đã update
+        warmup_clip_multiplier: float = 1.2, # ← THÊM
+        warmup_rounds: int = 3,              # ← THÊM
+        use_median: bool = False,
+        min_trusted_for_median: int = 2,
     ):
         self.trust_manager          = trust_manager
         self.enable_filtering       = enable_filtering
@@ -138,7 +140,8 @@ class TrustAwareAggregator:
         self.clip_multiplier        = clip_multiplier
         self.use_median             = use_median
         self.min_trusted_for_median = min_trusted_for_median
-
+        self.warmup_clip_multiplier = warmup_clip_multiplier
+        self.warmup_rounds          = warmup_rounds
         # Tracking stats
         self.skipped_rounds   = 0
         self.filtered_counts  = []   # # clients filtered each round
@@ -182,7 +185,12 @@ class TrustAwareAggregator:
                 for u in updates
             ]
             median_norm = float(np.median(norms))
-            clip_norm   = self.clip_multiplier * max(median_norm, 1e-6)
+            effective_clip = (
+                self.warmup_clip_multiplier
+                if round_num < self.warmup_rounds
+                else self.clip_multiplier
+            )
+            clip_norm = effective_clip * max(median_norm, 1e-6)
 
             clipped_updates = []
             for u, norm in zip(updates, norms):
