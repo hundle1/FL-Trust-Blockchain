@@ -128,7 +128,7 @@ class TrustAwareAggregator:
         trust_manager,
         enable_filtering: bool = True,
         enable_norm_clip: bool = True,
-        clip_multiplier: float = 2.0,   # 2.0 = stricter clip (was 2.5) — poison ít lọt hơn
+        clip_multiplier: float = 2.5,
         use_median: bool = True,              # FIX 4: dùng median thay weighted mean
         min_trusted_for_median: int = 2,      # fallback sang mean nếu < N trusted
     ):
@@ -181,11 +181,7 @@ class TrustAwareAggregator:
                 float(np.sqrt(sum(torch.norm(v).item() ** 2 for v in u.values())))
                 for u in updates
             ]
-            # Robust median: use median of lower 60% norms only so attacker norms don't inflate clip
-            n_norms = len(norms)
-            k = max(1, int(n_norms * 0.6))
-            sorted_norms = sorted(norms)
-            median_norm = float(np.median(sorted_norms[:k]))
+            median_norm = float(np.median(norms))
             clip_norm   = self.clip_multiplier * max(median_norm, 1e-6)
 
             clipped_updates = []

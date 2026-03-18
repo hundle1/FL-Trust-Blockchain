@@ -67,7 +67,7 @@ class TrustScoreManager:
         num_clients: int,
         alpha: float = 0.5,              # STRONG: was 0.75 → trust đổi nhanh gấp 2x
         tau: float = 0.45,               # STRONG: was 0.5 → filter với margin tốt hơn
-        initial_trust: float = 0.3,      # STRONG: was 0.5 → không include ngay
+        initial_trust: float = 0.5,      # FIXED: 0.5 >= tau=0.45 → benign included từ round 0
         enable_decay: bool = True,
         decay_strategy: str = "exponential",
         window_size: int = 5,
@@ -77,8 +77,8 @@ class TrustScoreManager:
         idle_decay_rate: float = 0.01,   # STRONG: was 0.008
         # NEW params
         enable_norm_penalty: bool = True,     # Phạt client có norm >> benign norm
-        norm_penalty_threshold: float = 2.0,  # norm/benign_norm > 2x → penalty (was 3.0)
-        norm_penalty_strength: float = 0.6,   # penalty factor — tăng để trust malicious giảm nhanh hơn
+        norm_penalty_threshold: float = 3.0,  # norm/benign_norm > 3x → penalty
+        norm_penalty_strength: float = 0.5,   # penalty factor (0=off, 1=zero out observation)
         warmup_rounds: int = 3,               # Không filter trong N rounds đầu
     ):
         self.num_clients        = num_clients
@@ -157,8 +157,8 @@ class TrustScoreManager:
           = 1.0 nếu norm bình thường
           < 1.0 nếu norm bất thường (quá lớn)
         """
-        if not self.enable_norm_penalty or len(self._norm_history) < 3:
-            return 1.0   # Chưa đủ data → không penalty (3 samples đủ để ước lượng sớm)
+        if not self.enable_norm_penalty or len(self._norm_history) < 5:
+            return 1.0   # Chưa đủ data → không penalty
 
         benign_norm_est = float(np.median(self._norm_history))
         if benign_norm_est < 1e-8:
@@ -169,10 +169,10 @@ class TrustScoreManager:
         if ratio <= self.norm_penalty_threshold:
             return 1.0   # Bình thường → không penalty
 
-        # Penalty tỷ lệ với mức độ vượt threshold (threshold=2.0)
-        # ratio = 2.0 → penalty = 1.0 (no penalty)
-        # ratio = 4.0 → penalty = 1 - strength * excess
-        # ratio rất lớn → penalty = 1 - norm_penalty_strength (floor)
+        # Penalty tỷ lệ với mức độ vượt threshold
+        # ratio = 3.0 → penalty = 1.0 (no penalty)
+        # ratio = 6.0 → penalty = 1 - 0.5 = 0.5
+        # ratio = 12.0 → penalty = max(1 - strength, 0) = 0.5
         excess = (ratio - self.norm_penalty_threshold) / self.norm_penalty_threshold
         penalty = 1.0 - min(self.norm_penalty_strength, self.norm_penalty_strength * excess)
         return float(np.clip(penalty, 1.0 - self.norm_penalty_strength, 1.0))
@@ -211,14 +211,14 @@ class TrustScoreManager:
         observation = observation * penalty   # giảm trust nếu norm bất thường
 
         # 4. Update benign norm estimate
-        #    Chỉ update nếu observation >= 0.35 (likely benign) — threshold hạ để build estimate sớm
+        #    Chỉ update nếu observation >= 0.4 (likely benign)
         #    Tránh bị poisoned update kéo lệch estimate
-        if observation >= 0.35:
+        if observation >= 0.4:
             self._norm_history.append(client_norm)
             if len(self._norm_history) > self._norm_window_size:
                 self._norm_history.pop(0)
 
-        # 5. EMA decay — nhanh hơn khi rõ ràng malicious (flipped gradient → observation ~0)
+        # 5. EMA decay (alpha nhỏ hơn → phản ứng nhanh hơn)
         if self.enable_decay:
             if self.decay_strategy == "threshold":
                 new_trust = TrustDecay.threshold_decay(old_trust, observation)
@@ -230,11 +230,7 @@ class TrustScoreManager:
                     old_trust, observation, variance, self.alpha
                 )
             else:
-                # Fast decay when clearly malicious (obs < 0.2) → trust drop in 1 round
-                alpha_eff = self.alpha
-                if observation < 0.2:
-                    alpha_eff = 0.25  # T_new ≈ 0.25*T_old → filter ngay sau 1 round
-                new_trust = TrustDecay.exponential_decay(old_trust, observation, alpha_eff)
+                new_trust = TrustDecay.exponential_decay(old_trust, observation, self.alpha)
         else:
             new_trust = self.alpha * old_trust + (1 - self.alpha) * observation
 
