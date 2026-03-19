@@ -1,49 +1,24 @@
 """
-Trust Score Manager — v3 STRONG DEFENSE
-=========================================
-Phân tích gốc rễ từ kết quả thực nghiệm:
+Trust Score Manager — v6 CALIBRATED
+=====================================
+Calibrated từ diagnose_norms.py:
+  Benign norm:   mean=4.24, std=0.08, p97=4.40
+  Attacker norm: mean=40.56 (ratio 9.57x)
 
-  PROBLEM 1: alpha=0.75 vẫn quá cao
-    → Sau 10 rounds bị tấn công, trust malicious vẫn ~0.53
-      (0.75^10 * 0.5 + correction ≈ 0.5+) → KHÔNG bị filter
-    FIX: alpha=0.5 → trust malicious xuống dưới tau sau ~5 rounds
-
-  PROBLEM 2: initial_trust=0.5 == tau=0.5
-    → Client mới NGAY LẬP TỨC được include
-    → Attacker round 0 đã có thể poison ngay
-    FIX: initial_trust=0.3 < tau=0.45
-
-  PROBLEM 3: tau=0.5 nhưng benign trust converge về ~0.6
-    → Margin chỉ 0.1, quá nhỏ → noise dễ gây false positive
-    → Đồng thời malicious cần xuống 0.49 mới bị filter
-    FIX: tau=0.45 (giảm một chút để benign có margin rộng hơn)
-         kết hợp alpha thấp hơn để malicious xuống nhanh hơn
-
-  PROBLEM 4: Similarity weight 0.9 nhưng norm của poisoned gradient
-    rất lớn (scale=5 * layer_boost=2.5 → 12.5x benign)
-    → cosine sim bị kéo về -1 → observation = 0 → trust giảm
-    → Nhưng với alpha=0.75: T_new = 0.75*0.5 + 0.25*0 = 0.375
-    → Cần ~3 rounds để xuống dưới tau=0.5
-    → Static attacker tấn công mọi round → 3 rounds đầu vẫn poison được
-    FIX: alpha=0.5 → T_new = 0.5*0.5 + 0.5*0 = 0.25 → filter ngay round 2
-
-  PROBLEM 5: Không có norm-based anomaly detection
-    → Gradient flip với scale=12.5x không bị detect bởi cosine sim alone
-    → Thêm norm ratio penalty vào observation
-
-  NEW FEATURE: Norm anomaly penalty
-    Nếu client gradient norm >> benign_norm_estimate:
-      observation bị nhân thêm penalty factor → trust giảm nhanh hơn
-
-Trust update formula:
-    S_i(t) = sim_weight * cosine_sim + loss_weight * loss_signal
-    S_i(t) *= norm_penalty(client)   ← NEW
-    T_i(t+1) = α * T_i(t) + (1 − α) * S_i(t)
+Changes vs v5:
+  - absolute_norm_threshold default = 15.0
+    (v5 dùng 6.0 → quá thấp, block cả benign norm ~4.2? Không,
+     4.2 < 6.0 → benign pass. Vấn đề thực: alpha=0.45 quá thấp
+     + cosine_sim thấp ở early rounds → trust benign rơi < tau)
+  - alpha default = 0.7 (ổn định hơn)
+  - tau default = 0.40
+  - initial_trust default = 0.65
+  - warmup_rounds default = 5
 """
 
 import torch
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from trust.history_buffer import ClientHistoryManager
 from trust.trust_decay import TrustDecay
 
@@ -52,71 +27,59 @@ class TrustScoreManager:
     """
     Manages trust scores for all clients in FL training.
 
-    v3 STRONG DEFENSE changes vs v2:
-      - alpha: 0.75 → 0.5   (trust thay đổi 2x nhanh hơn)
-      - tau: 0.5 → 0.45     (benign có margin rộng hơn, malicious bị filter sớm hơn)
-      - initial_trust: 0.5 → 0.3  (không include ngay từ đầu)
-      - idle_decay_rate: 0.008 → 0.01
-      - NEW: norm_clip_percentile — detect norm outliers
-      - NEW: warmup_rounds — trust không được dùng để filter trong N rounds đầu
-               (tránh false positive khi model chưa ổn định)
+    v6 CALIBRATED — defaults based on diagnose_norms.py measurements:
+      Benign norm ~4.2, Attacker norm ~40.6, ratio=9.57x
     """
 
     def __init__(
         self,
         num_clients: int,
-        alpha: float = 0.5,              # STRONG: was 0.75 → trust đổi nhanh gấp 2x
-        tau: float = 0.45,               # STRONG: was 0.5 → filter với margin tốt hơn
-        initial_trust: float = 0.5,      # FIXED: 0.5 >= tau=0.45 → benign included từ round 0
+        alpha: float = 0.7,
+        tau: float = 0.40,
+        initial_trust: float = 0.65,
         enable_decay: bool = True,
         decay_strategy: str = "exponential",
-        window_size: int = 5,
+        window_size: int = 10,
         min_trust: float = 0.0,
         max_trust: float = 1.0,
-        similarity_weight: float = 0.9,
-        idle_decay_rate: float = 0.01,   # STRONG: was 0.008
-        # NEW params
-        enable_norm_penalty: bool = True,     # Phạt client có norm >> benign norm
-        norm_penalty_threshold: float = 3.0,  # norm/benign_norm > 3x → penalty
-        norm_penalty_strength: float = 0.5,   # penalty factor (0=off, 1=zero out observation)
-        warmup_rounds: int = 3,               # Không filter trong N rounds đầu
+        similarity_weight: float = 0.6,
+        idle_decay_rate: float = 0.001,
+        enable_norm_penalty: bool = True,
+        norm_penalty_threshold: float = 3.0,
+        norm_penalty_strength: float = 0.90,
+        absolute_norm_threshold: float = 15.0,
+        warmup_rounds: int = 5,
     ):
-        self.num_clients        = num_clients
-        self.alpha              = alpha
-        self.tau                = tau
-        self.initial_trust      = initial_trust
-        self.enable_decay       = enable_decay
-        self.decay_strategy     = decay_strategy
-        self.min_trust          = min_trust
-        self.max_trust          = max_trust
-        self.similarity_weight  = similarity_weight
-        self.idle_decay_rate    = idle_decay_rate
-        self.enable_norm_penalty    = enable_norm_penalty
-        self.norm_penalty_threshold = norm_penalty_threshold
-        self.norm_penalty_strength  = norm_penalty_strength
-        self.warmup_rounds      = warmup_rounds
+        self.num_clients             = num_clients
+        self.alpha                   = alpha
+        self.tau                     = tau
+        self.initial_trust           = initial_trust
+        self.enable_decay            = enable_decay
+        self.decay_strategy          = decay_strategy
+        self.min_trust               = min_trust
+        self.max_trust               = max_trust
+        self.similarity_weight       = similarity_weight
+        self.idle_decay_rate         = idle_decay_rate
+        self.enable_norm_penalty     = enable_norm_penalty
+        self.norm_penalty_threshold  = norm_penalty_threshold
+        self.norm_penalty_strength   = norm_penalty_strength
+        self.absolute_norm_threshold = absolute_norm_threshold
+        self.warmup_rounds           = warmup_rounds
 
-        # Trust scores
         self.trust_scores = np.full(num_clients, initial_trust, dtype=np.float64)
-
-        # History tracking
-        self.history_manager = ClientHistoryManager(num_clients, window_size)
-
-        # Round participation tracking
+        self.history_manager     = ClientHistoryManager(num_clients, window_size)
         self.last_participated   = np.full(num_clients, -1, dtype=int)
         self.participation_count = np.zeros(num_clients, dtype=int)
 
-        # Norm tracking — running estimate of benign gradient norms
-        # Used for norm anomaly detection
-        self._norm_history: List[float] = []   # rolling window of recent norms
-        self._norm_window_size = 20
+        # Norm history — chỉ chứa norms của updates rõ ràng là benign
+        self._norm_history: List[float] = []
+        self._norm_window_size = 30
 
-        # Statistics
         self.update_count  = 0
         self.round_history: List[Dict] = []
 
     # ------------------------------------------------------------------
-    # Core trust update
+    # Core similarity
     # ------------------------------------------------------------------
 
     def compute_gradient_similarity(
@@ -124,10 +87,7 @@ class TrustScoreManager:
         client_update: Dict[str, torch.Tensor],
         reference_gradient: Dict[str, torch.Tensor]
     ) -> float:
-        """
-        Cosine similarity between client update and reference gradient.
-        Maps [-1, 1] → [0, 1].
-        """
+        """Cosine similarity, mapped [-1,1] → [0,1]."""
         client_flat = torch.cat([v.flatten() for v in client_update.values()])
         ref_flat    = torch.cat([v.flatten() for v in reference_gradient.values()])
 
@@ -142,24 +102,40 @@ class TrustScoreManager:
         return float(np.clip(similarity, 0.0, 1.0))
 
     def _compute_norm(self, update: Dict[str, torch.Tensor]) -> float:
-        """L2 norm của gradient."""
         total = sum(torch.norm(v).item() ** 2 for v in update.values())
         return float(np.sqrt(total))
 
+    # ------------------------------------------------------------------
+    # Norm penalty
+    # ------------------------------------------------------------------
+
     def _norm_penalty(self, client_norm: float) -> float:
         """
-        NEW: Tính penalty factor dựa trên norm ratio.
+        Tính norm penalty.
 
-        Nếu client gradient norm >> benign estimate:
-          → penalty < 1.0 → observation bị giảm → trust giảm nhanh hơn
+        Early rounds (< 3 obs in history):
+          Dùng absolute_norm_threshold để detect outlier ngay.
+          Benign ~4.2, threshold=15 → benign luôn penalty=1.0
+          Attacker ~40 >> 15 → bị penalize mạnh
 
-        Trả về: penalty ∈ [1 - norm_penalty_strength, 1.0]
-          = 1.0 nếu norm bình thường
-          < 1.0 nếu norm bất thường (quá lớn)
+        Sau khi có history:
+          Dùng median-based penalty với norm_penalty_threshold
         """
-        if not self.enable_norm_penalty or len(self._norm_history) < 5:
-            return 1.0   # Chưa đủ data → không penalty
+        if not self.enable_norm_penalty:
+            return 1.0
 
+        if len(self._norm_history) < 3:
+            # Early: absolute threshold
+            if client_norm > self.absolute_norm_threshold:
+                # Attacker ~40, threshold=15 → ratio = 40/15 = 2.67
+                # penalty = 1 - 0.9 * min(1, (2.67-1)/2) = 1 - 0.9*0.835 = 0.25
+                ratio = client_norm / self.absolute_norm_threshold
+                excess = min(1.0, (ratio - 1.0) / 2.0)
+                penalty = 1.0 - self.norm_penalty_strength * excess
+                return float(np.clip(penalty, 1.0 - self.norm_penalty_strength, 1.0))
+            return 1.0
+
+        # History-based: median
         benign_norm_est = float(np.median(self._norm_history))
         if benign_norm_est < 1e-8:
             return 1.0
@@ -167,15 +143,19 @@ class TrustScoreManager:
         ratio = client_norm / benign_norm_est
 
         if ratio <= self.norm_penalty_threshold:
-            return 1.0   # Bình thường → không penalty
+            return 1.0
 
-        # Penalty tỷ lệ với mức độ vượt threshold
-        # ratio = 3.0 → penalty = 1.0 (no penalty)
-        # ratio = 6.0 → penalty = 1 - 0.5 = 0.5
-        # ratio = 12.0 → penalty = max(1 - strength, 0) = 0.5
+        # ratio=3x → no penalty (at threshold)
+        # ratio=6x → penalty = 1 - 0.9 * min(1, 3/3) = 0.1
+        # ratio=9.57x (attacker) → max penalty = 1-0.9 = 0.1
         excess = (ratio - self.norm_penalty_threshold) / self.norm_penalty_threshold
-        penalty = 1.0 - min(self.norm_penalty_strength, self.norm_penalty_strength * excess)
+        penalty = 1.0 - min(self.norm_penalty_strength,
+                            self.norm_penalty_strength * excess)
         return float(np.clip(penalty, 1.0 - self.norm_penalty_strength, 1.0))
+
+    # ------------------------------------------------------------------
+    # Core trust update
+    # ------------------------------------------------------------------
 
     def update_trust(
         self,
@@ -185,19 +165,12 @@ class TrustScoreManager:
         metrics: Optional[Dict[str, float]] = None,
         round_num: int = 0
     ) -> float:
-        """
-        Update trust score cho client sau khi nhận update.
-
-        v3 changes:
-          - Thêm norm penalty trước EMA
-          - alpha nhỏ hơn → phản ứng nhanh hơn
-        """
         old_trust = self.trust_scores[client_id]
 
-        # 1. Cosine similarity (primary signal)
+        # 1. Cosine similarity
         similarity = self.compute_gradient_similarity(client_update, reference_gradient)
 
-        # 2. Loss-based signal (secondary)
+        # 2. Observation = weighted sum of signals
         loss_weight = 1.0 - self.similarity_weight
         if metrics is not None and metrics.get('loss') is not None:
             loss_signal = self._loss_signal(client_id, metrics['loss'])
@@ -205,20 +178,20 @@ class TrustScoreManager:
         else:
             observation = similarity
 
-        # 3. NEW: Norm penalty
+        # 3. Norm penalty
         client_norm = self._compute_norm(client_update)
         penalty     = self._norm_penalty(client_norm)
-        observation = observation * penalty   # giảm trust nếu norm bất thường
+        observation = observation * penalty
 
-        # 4. Update benign norm estimate
-        #    Chỉ update nếu observation >= 0.4 (likely benign)
-        #    Tránh bị poisoned update kéo lệch estimate
-        if observation >= 0.4:
+        # 4. Update norm_history — chỉ accept norm < absolute_norm_threshold
+        #    Đảm bảo benign norms (~4.2) luôn vào history
+        #    Attacker norms (~40) không vào
+        if client_norm < self.absolute_norm_threshold:
             self._norm_history.append(client_norm)
             if len(self._norm_history) > self._norm_window_size:
                 self._norm_history.pop(0)
 
-        # 5. EMA decay (alpha nhỏ hơn → phản ứng nhanh hơn)
+        # 5. EMA decay
         if self.enable_decay:
             if self.decay_strategy == "threshold":
                 new_trust = TrustDecay.threshold_decay(old_trust, observation)
@@ -238,12 +211,12 @@ class TrustScoreManager:
         new_trust = float(np.clip(new_trust, self.min_trust, self.max_trust))
 
         # 7. Store
-        self.trust_scores[client_id]       = new_trust
-        self.last_participated[client_id]  = round_num
+        self.trust_scores[client_id]        = new_trust
+        self.last_participated[client_id]   = round_num
         self.participation_count[client_id] += 1
         self.update_count += 1
 
-        # 8. Update history
+        # 8. History
         self.history_manager.add_gradient_similarity(client_id, similarity)
         self.history_manager.add_trust(client_id, new_trust)
         if metrics:
@@ -275,13 +248,8 @@ class TrustScoreManager:
         round_num: int,
         decay_rate: float = None
     ):
-        """
-        Apply trust decay to non-participating clients.
-        v3: rate tăng 0.008 → 0.01
-        """
         if not self.enable_decay:
             return
-
         rate       = decay_rate if decay_rate is not None else self.idle_decay_rate
         active_set = set(active_client_ids)
         for cid in range(self.num_clients):
@@ -291,7 +259,7 @@ class TrustScoreManager:
                 )
 
     # ------------------------------------------------------------------
-    # Querying — với warmup support
+    # Querying
     # ------------------------------------------------------------------
 
     def get_trust_score(self, client_id: int) -> float:
@@ -303,17 +271,11 @@ class TrustScoreManager:
     def get_trusted_clients(
         self,
         client_ids: List[int],
-        round_num: int = 999   # NEW: warmup bypass
+        round_num: int = 999
     ) -> List[int]:
-        """
-        Trả về danh sách trusted clients.
-
-        NEW: Trong warmup_rounds đầu, trả về TẤT CẢ clients
-        (tránh false positive khi trust chưa calibrate xong)
-        Sau warmup → filter bình thường.
-        """
+        """Bypass filter trong warmup_rounds đầu."""
         if round_num < self.warmup_rounds:
-            return list(client_ids)   # warmup: include all
+            return list(client_ids)
         return [cid for cid in client_ids if self.trust_scores[cid] >= self.tau]
 
     def get_trust_weights(self, client_ids: List[int]) -> List[float]:
@@ -331,18 +293,19 @@ class TrustScoreManager:
         scores       = self.trust_scores
         trusted_mask = scores >= self.tau
         return {
-            'mean_trust':    float(np.mean(scores)),
-            'std_trust':     float(np.std(scores)),
-            'min_trust':     float(np.min(scores)),
-            'max_trust':     float(np.max(scores)),
-            'num_trusted':   int(trusted_mask.sum()),
-            'num_untrusted': int((~trusted_mask).sum()),
-            'trusted_ratio': float(trusted_mask.sum() / self.num_clients),
-            'tau':   self.tau,
-            'alpha': self.alpha,
-            'total_updates': self.update_count,
-            'benign_norm_estimate': float(np.median(self._norm_history))
-                                    if self._norm_history else 0.0,
+            'mean_trust':         float(np.mean(scores)),
+            'std_trust':          float(np.std(scores)),
+            'min_trust':          float(np.min(scores)),
+            'max_trust':          float(np.max(scores)),
+            'num_trusted':        int(trusted_mask.sum()),
+            'num_untrusted':      int((~trusted_mask).sum()),
+            'trusted_ratio':      float(trusted_mask.sum() / self.num_clients),
+            'tau':                self.tau,
+            'alpha':              self.alpha,
+            'total_updates':      self.update_count,
+            'norm_history_size':  len(self._norm_history),
+            'benign_norm_est':    float(np.median(self._norm_history))
+                                  if self._norm_history else 0.0,
         }
 
     def get_trust_separation(
@@ -370,7 +333,7 @@ class TrustScoreManager:
         return self.history_manager.get_statistics(client_id)
 
     def reset_client(self, client_id: int):
-        self.trust_scores[client_id]       = self.initial_trust
+        self.trust_scores[client_id]        = self.initial_trust
         self.participation_count[client_id] = 0
         self.history_manager.clear_client(client_id)
 

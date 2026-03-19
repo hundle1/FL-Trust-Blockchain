@@ -1,53 +1,78 @@
 """
-Trust-Aware Aggregation — v4 FULL DEFENSE
-==========================================
-Tất cả 4 hướng fix đã được yêu cầu:
+Trust-Aware Aggregation — v5 FIXED
+=====================================
+Fixes vs v4:
 
-  FIX 1: alpha giảm (0.75→0.5)          — trong trust_score.py
-  FIX 2: tau tăng (0.5→0.45 + init=0.3) — trong trust_score.py
-  FIX 3: Norm-clipping trước aggregate  — trong file này (giữ từ v3)
-  FIX 4: Median thay weighted mean      — THÊM MỚI trong file này
+  FIX 1: Reference gradient cho trust update phải ROBUST hơn.
+    Cũ: dùng mean(benign_selected_updates) — nếu không có benign trong round
+        thì fallback về mean(all) → ref bị contaminate bởi attackers.
+    Fix: dùng MEDIAN thay mean để tính reference gradient.
+         Median robust với outliers: dù 30-40% updates là poisoned,
+         median vẫn gần với benign direction.
+         Đây là reference chỉ dùng cho trust scoring, không phải aggregation.
 
-──────────────────────────────────────────────────────────────────────
-FIX 4 — Coordinate-wise Median Aggregation (Yin et al., ICML 2018)
+  FIX 2: Norm clipping warmup multiplier phải CHẶT hơn cho static attack.
+    Static attacker có norm 10-25x benign.
+    warmup_clip_multiplier=1.2 → clip rất chặt ngay từ đầu.
+    Sau warmup: clip_multiplier=1.5 (vẫn chặt).
 
-  Bản cũ (weighted mean):
-    agg[k] = Σ w_i * update_i[k]
-    → 1 poisoned update với norm 12.5x CÓ THỂ kéo lệch sum nếu weight cao
-    → Ngay cả sau norm-clip, nếu attacker lọt qua trust filter thì
-      weighted mean vẫn bị ảnh hưởng tuyến tính
+  FIX 3: get_stats() expose thêm info để debug.
 
-  Bản mới (coordinate-wise median của trusted updates):
-    agg[k] = median({update_i[k] : i ∈ trusted})   ← per element
-    → Robust với up to ⌊n/2⌋ - 1 Byzantine clients
-    → 1 outlier value tại bất kỳ coordinate nào không ảnh hưởng được kết quả
-    → Không cần biết số lượng attacker trước
-
-  Pipeline hoàn chỉnh mỗi round:
-    1. Norm-clip tất cả updates về clip_multiplier × median_norm
-    2. Trust-filter: loại bỏ client dưới tau
-    3. Coordinate-wise median trên trusted + clipped updates
-    4. Return None nếu < 2 trusted clients (giữ model)
-
-  Tại sao cần cả norm-clip VÀ median?
-    - Norm-clip: chặn outlier lớn, giúp median ổn định hơn
-    - Median: robust với attacker vượt qua trust filter
-    - Kết hợp: defense-in-depth, mỗi lớp chặn một loại tấn công khác nhau
-
-  Trade-off của median vs weighted mean:
-    + Robust hơn (không bị 1 outlier dominate)
-    - Hội tụ chậm hơn một chút ở giai đoạn đầu (gradient noise cao hơn)
-    → Đây là lý do ta vẫn giữ norm-clip: giảm noise của median
-
-  Khi nào vẫn dùng weighted mean (fallback)?
-    - Nếu chỉ có 1 trusted client → median = chính nó → dùng luôn
-    - Nếu use_median=False → dùng weighted mean như cũ (backward compat)
-──────────────────────────────────────────────────────────────────────
+Pipeline mỗi round (không đổi):
+  1. Norm clipping (median-based, trước filter)
+  2. Trust filtering (sau warmup)
+  3. Coordinate-wise median hoặc weighted mean
+  4. Return None nếu 0 trusted → giữ model
 """
 
 import torch
 from typing import Dict, List, Optional
 import numpy as np
+
+
+# ── Helper: tính robust reference gradient bằng coordinate-wise median ──
+
+def _robust_reference(
+    updates: List[Dict[str, torch.Tensor]]
+) -> Dict[str, torch.Tensor]:
+    """
+    FIX: Tính reference gradient bằng coordinate-wise median.
+
+    Dùng để compute cosine similarity cho trust scoring.
+    Median robust với Byzantine updates: dù 40% updates là poisoned,
+    median vẫn nằm trong benign region (Yin et al., ICML 2018).
+
+    Khác với _coordinate_median (dùng cho aggregation):
+      - Hàm này chạy trên TẤT CẢ updates (cả poisoned) để tạo reference
+      - _coordinate_median chạy chỉ trên TRUSTED updates
+
+    Args:
+        updates: List of gradient dicts (mix of benign + malicious)
+
+    Returns:
+        median_ref: Coordinate-wise median → robust reference
+    """
+    if len(updates) == 1:
+        return {k: v.clone() for k, v in updates[0].items()}
+
+    result = {}
+    for name in updates[0].keys():
+        stacked = torch.stack([u[name] for u in updates], dim=0)
+        result[name] = torch.median(stacked, dim=0).values
+    return result
+
+
+def _mean_reference(
+    updates: List[Dict[str, torch.Tensor]]
+) -> Dict[str, torch.Tensor]:
+    """Fallback: mean reference (dùng khi chỉ có benign updates)."""
+    n = len(updates)
+    result = {}
+    for name in updates[0].keys():
+        result[name] = torch.mean(
+            torch.stack([u[name] for u in updates], dim=0), dim=0
+        )
+    return result
 
 
 # ── Helper: norm clipping ────────────────────────────────────────────
@@ -56,10 +81,7 @@ def _clip_update_by_norm(
     update: Dict[str, torch.Tensor],
     clip_norm: float
 ) -> Dict[str, torch.Tensor]:
-    """
-    Clip gradient update về clip_norm nếu norm vượt quá.
-    Trả về update gốc nếu norm đã trong ngưỡng (không copy thừa).
-    """
+    """Clip gradient về clip_norm nếu vượt quá."""
     current_norm = float(np.sqrt(
         sum(torch.norm(v).item() ** 2 for v in update.values())
     ))
@@ -69,34 +91,18 @@ def _clip_update_by_norm(
     return {k: v * scale for k, v in update.items()}
 
 
-# ── Helper: coordinate-wise median ───────────────────────────────────
+# ── Helper: coordinate-wise median (cho aggregation) ─────────────────
 
 def _coordinate_median(
     updates: List[Dict[str, torch.Tensor]]
 ) -> Dict[str, torch.Tensor]:
-    """
-    Coordinate-wise median across a list of gradient updates.
-
-    Với mỗi tham số p và mỗi vị trí (i,j,...):
-        result[p][i,j,...] = median({update[p][i,j,...] : update ∈ updates})
-
-    Complexity: O(n log n × num_params × param_size)
-    Với n=4 trusted clients và MNIST CNN: rất nhanh (< 1ms)
-
-    Args:
-        updates: List of gradient dicts, all với cùng keys/shapes
-
-    Returns:
-        median_update: Dict với cùng keys, mỗi value là median tensor
-    """
+    """Coordinate-wise median của trusted + clipped updates."""
     if len(updates) == 1:
         return {k: v.clone() for k, v in updates[0].items()}
 
     result = {}
     for name in updates[0].keys():
-        # Stack: shape (n_clients, *param_shape)
         stacked = torch.stack([u[name] for u in updates], dim=0)
-        # torch.median theo dim=0, lấy values (không lấy indices)
         result[name] = torch.median(stacked, dim=0).values
     return result
 
@@ -105,22 +111,16 @@ def _coordinate_median(
 
 class TrustAwareAggregator:
     """
-    Trust-Aware Federated Aggregation — v4 FULL DEFENSE.
+    Trust-Aware Federated Aggregation — v5 FIXED.
 
     Pipeline mỗi round:
-      1. Norm clipping (trước filter) — chặn gradient flip lớn
-      2. Trust filtering — loại client dưới tau
-      3. Coordinate-wise median (thay weighted mean) — robust aggregation
-      4. Return None nếu < 1 trusted client → giữ nguyên model
+      1. Norm clipping (median-based, trước filter)
+      2. Trust filtering (sau warmup_rounds)
+      3. Coordinate-wise median (trusted + clipped updates)
+      4. Return None nếu 0 trusted → giữ model
 
-    Constructor params:
-      trust_manager:     TrustScoreManager instance
-      enable_filtering:  Bật/tắt trust filtering
-      enable_norm_clip:  Bật/tắt norm clipping (default True)
-      clip_multiplier:   Clip về X × median_norm (default 2.5)
-      use_median:        True = coordinate-wise median (NEW, default True)
-                         False = trust-weighted mean (backward compat)
-      min_trusted_for_median: Số trusted tối thiểu để dùng median (default 2)
+    NEW: compute_reference() method — tính robust reference gradient
+         cho trust scoring bên ngoài aggregator.
     """
 
     def __init__(
@@ -128,9 +128,9 @@ class TrustAwareAggregator:
         trust_manager,
         enable_filtering: bool = True,
         enable_norm_clip: bool = True,
-        clip_multiplier: float = 1.5,        # đã update
-        warmup_clip_multiplier: float = 1.2, # ← THÊM
-        warmup_rounds: int = 3,              # ← THÊM
+        clip_multiplier: float = 1.5,
+        warmup_clip_multiplier: float = 1.2,
+        warmup_rounds: int = 1,            # FIX: từ 3 → 1 (match trust_score.py)
         use_median: bool = False,
         min_trusted_for_median: int = 2,
     ):
@@ -138,16 +138,68 @@ class TrustAwareAggregator:
         self.enable_filtering       = enable_filtering
         self.enable_norm_clip       = enable_norm_clip
         self.clip_multiplier        = clip_multiplier
-        self.use_median             = use_median
-        self.min_trusted_for_median = min_trusted_for_median
         self.warmup_clip_multiplier = warmup_clip_multiplier
         self.warmup_rounds          = warmup_rounds
+        self.use_median             = use_median
+        self.min_trusted_for_median = min_trusted_for_median
+
         # Tracking stats
-        self.skipped_rounds   = 0
-        self.filtered_counts  = []   # # clients filtered each round
-        self.clip_counts      = []   # # clients clipped each round
-        self.median_rounds    = 0    # rounds where median was used
-        self.mean_rounds      = 0    # rounds where mean was used (fallback)
+        self.skipped_rounds  = 0
+        self.filtered_counts = []
+        self.clip_counts     = []
+        self.median_rounds   = 0
+        self.mean_rounds     = 0
+
+    # ------------------------------------------------------------------
+    # NEW: Compute robust reference gradient for trust scoring
+    # ------------------------------------------------------------------
+
+    def compute_reference(
+        self,
+        updates: List[Dict[str, torch.Tensor]],
+        client_ids: List[int],
+        malicious_ids: Optional[set] = None,
+        use_robust: bool = True
+    ) -> Dict[str, torch.Tensor]:
+        """
+        FIX: Tính reference gradient robust cho trust scoring.
+
+        Strategy (theo thứ tự ưu tiên):
+          1. Nếu có benign_ids và đủ benign: mean(benign_updates)
+             — chính xác nhất vì chỉ dùng benign
+          2. Nếu use_robust=True: median(all_updates)
+             — robust với up to 49% Byzantine
+          3. Fallback: mean(all_updates)
+             — như cũ, dễ bị contaminate
+
+        Args:
+            updates:       All updates this round
+            client_ids:    Corresponding client IDs
+            malicious_ids: Known malicious IDs (nếu biết, chỉ dùng cho research)
+            use_robust:    True = dùng median nếu không có benign info
+
+        Returns:
+            ref_gradient: Robust reference gradient
+        """
+        if malicious_ids is not None:
+            # Research mode: biết malicious IDs → dùng chỉ benign updates
+            benign_ups = [
+                updates[i] for i, cid in enumerate(client_ids)
+                if cid not in malicious_ids
+            ]
+            if benign_ups:
+                return _mean_reference(benign_ups)
+
+        if use_robust and len(updates) >= 2:
+            # Production mode: không biết malicious → dùng median (robust)
+            return _robust_reference(updates)
+
+        # Fallback: mean of all
+        return _mean_reference(updates)
+
+    # ------------------------------------------------------------------
+    # Main aggregation pipeline
+    # ------------------------------------------------------------------
 
     def aggregate(
         self,
@@ -162,20 +214,17 @@ class TrustAwareAggregator:
         Args:
             updates:    List of model update dicts
             client_ids: Corresponding client IDs
-            metrics:    Training metrics per client (unused in median, kept for compat)
-            round_num:  Current round number (for warmup bypass)
+            metrics:    Training metrics per client (unused in median)
+            round_num:  Current round number
 
         Returns:
-            Aggregated update dict, hoặc None nếu không có trusted client
-            (caller nên giữ nguyên model round này)
+            Aggregated update dict, hoặc None nếu 0 trusted clients
         """
         n = len(updates)
         if n == 0:
             return None
 
-        # ── STEP 1: Norm clipping ─────────────────────────────────────
-        # Tính median norm TRƯỚC KHI filter để estimate benign norm chính xác
-        # (nếu tính sau filter thì có thể bị attacker lọt vào estimate)
+        # ── STEP 1: Norm clipping ──────────────────────────────────────
         clipped_updates = updates
         num_clipped = 0
 
@@ -202,18 +251,17 @@ class TrustAwareAggregator:
 
         self.clip_counts.append(num_clipped)
 
-        # ── STEP 2: Trust filtering ───────────────────────────────────
+        # ── STEP 2: Trust filtering ────────────────────────────────────
         if self.enable_filtering:
             trusted_ids = self.trust_manager.get_trusted_clients(client_ids, round_num)
             self.filtered_counts.append(len(client_ids) - len(trusted_ids))
 
             if len(trusted_ids) == 0:
                 self.skipped_rounds += 1
-                print(f"  [TrustAware v4] WARNING: No trusted clients round {round_num} "
+                print(f"  [TrustAware v5] WARNING: No trusted clients round {round_num} "
                       f"— skipping update (total skipped: {self.skipped_rounds})")
                 return None
 
-            # Chỉ giữ lại trusted updates
             trusted_updates    = []
             trusted_client_ids = []
             for i, cid in enumerate(client_ids):
@@ -226,17 +274,14 @@ class TrustAwareAggregator:
         else:
             self.filtered_counts.append(0)
 
-        # ── STEP 3: Aggregation ───────────────────────────────────────
+        # ── STEP 3: Aggregation ────────────────────────────────────────
         n_trusted = len(clipped_updates)
 
         if self.use_median and n_trusted >= self.min_trusted_for_median:
-            # FIX 4: Coordinate-wise median — robust với Byzantine clients
             aggregated = _coordinate_median(clipped_updates)
             self.median_rounds += 1
-
         else:
-            # Fallback: trust-weighted mean
-            # Dùng khi: use_median=False, hoặc quá ít trusted clients
+            # Trust-weighted mean
             raw_weights = np.array([
                 self.trust_manager.get_trust_score(cid)
                 for cid in client_ids
@@ -260,18 +305,18 @@ class TrustAwareAggregator:
 
     def get_stats(self) -> Dict:
         return {
-            'skipped_rounds':   self.skipped_rounds,
-            'avg_filtered':     float(np.mean(self.filtered_counts))
-                                if self.filtered_counts else 0.0,
-            'avg_clipped':      float(np.mean(self.clip_counts))
-                                if self.clip_counts else 0.0,
-            'total_rounds':     len(self.filtered_counts),
-            'median_rounds':    self.median_rounds,
-            'mean_rounds':      self.mean_rounds,
+            'skipped_rounds': self.skipped_rounds,
+            'avg_filtered':   float(np.mean(self.filtered_counts))
+                              if self.filtered_counts else 0.0,
+            'avg_clipped':    float(np.mean(self.clip_counts))
+                              if self.clip_counts else 0.0,
+            'total_rounds':   len(self.filtered_counts),
+            'median_rounds':  self.median_rounds,
+            'mean_rounds':    self.mean_rounds,
         }
 
 
-# ── Baseline aggregators (không thay đổi logic) ──────────────────────
+# ── Baseline aggregators ─────────────────────────────────────────────
 
 class FedAvgAggregator:
     """Standard FedAvg — uniform average (baseline, không có defense)."""
@@ -293,9 +338,11 @@ class FedAvgAggregator:
         return aggregated
 
     def get_stats(self) -> Dict:
-        return {'skipped_rounds': 0, 'avg_filtered': 0.0,
-                'avg_clipped': 0.0, 'total_rounds': 0,
-                'median_rounds': 0, 'mean_rounds': 0}
+        return {
+            'skipped_rounds': 0, 'avg_filtered': 0.0,
+            'avg_clipped': 0.0,  'total_rounds': 0,
+            'median_rounds': 0,  'mean_rounds': 0,
+        }
 
 
 class KrumAggregator:
@@ -327,9 +374,11 @@ class KrumAggregator:
         return updates[selected_idx]
 
     def get_stats(self) -> Dict:
-        return {'skipped_rounds': 0, 'avg_filtered': 0.0,
-                'avg_clipped': 0.0, 'total_rounds': 0,
-                'median_rounds': 0, 'mean_rounds': 0}
+        return {
+            'skipped_rounds': 0, 'avg_filtered': 0.0,
+            'avg_clipped': 0.0,  'total_rounds': 0,
+            'median_rounds': 0,  'mean_rounds': 0,
+        }
 
 
 class TrimmedMeanAggregator:
@@ -359,6 +408,8 @@ class TrimmedMeanAggregator:
         return aggregated
 
     def get_stats(self) -> Dict:
-        return {'skipped_rounds': 0, 'avg_filtered': 0.0,
-                'avg_clipped': 0.0, 'total_rounds': 0,
-                'median_rounds': 0, 'mean_rounds': 0}
+        return {
+            'skipped_rounds': 0, 'avg_filtered': 0.0,
+            'avg_clipped': 0.0,  'total_rounds': 0,
+            'median_rounds': 0,  'mean_rounds': 0,
+        }
