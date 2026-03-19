@@ -1,19 +1,18 @@
 """
-Experiment: Trust-Aware Defense vs Attackers — v8 PRETRAIN
+Experiment: Trust-Aware Defense — v9 TRUST-FOCUSED
 
-Insight từ tất cả các version trước:
-  - v5: 29% vì model frozen từ round 1 (no trusted clients → skip update mọi round)
-  - v6/v7: 11% vì model collapse round 1 rồi stuck
+Mục tiêu paper: Chứng minh trust mechanism PHÂN LOẠI được client độc hại.
+  - Primary metric: Trust Separation (benign vs malicious)
+  - Primary metric: Detection Rate (% malicious bị filter)
+  - Primary metric: Trust Evolution over rounds
+  - Secondary metric: Accuracy (hệ quả tự nhiên của defense tốt)
 
-Giải pháp: PRE-TRAIN model N rounds sạch TRƯỚC khi bật attack + defense.
-  - Pretrain 10 rounds: model đạt ~90%+ accuracy
-  - Sau đó bật attack + trust defense bình thường
-  - Defense chỉ cần giữ model không bị kéo xuống, không cần recover từ đầu
+Giữ clip norm để tất cả 6 attack types đều có accuracy cao,
+từ đó focus vào phân tích trust mechanism là contribution chính.
 
-Config: quay về gốc đơn giản, đã được validate.
-  ALPHA=0.9, TAU=0.3, INITIAL_TRUST=1.0 (config gốc hoạt động tốt)
-  Thêm PRETRAIN_ROUNDS=10
-  Norm clip: CLIP_MULTIPLIER=2.0 (4.23*2=8.46, attacker 40→8.46 clipped)
+Config v9: giữ nguyên v8 (đã validated 98.87% với static)
+  ENABLE_NORM_CLIP = True  ← bật lại
+  Thêm metrics: detection_rate, trust_separation_history, filtered_per_round
 """
 
 import sys
@@ -29,6 +28,7 @@ from typing import Dict, List, Optional
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import seaborn as sns
 
 from models.cnn_mnist import get_model
@@ -53,34 +53,31 @@ print(f"Device: {DEVICE}"
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CONFIG — v8: pretrain + đơn giản hóa
+# CONFIG
 # ══════════════════════════════════════════════════════════════════════
 
 ATTACK_RATE       = 0.20
 POISONING_SCALE   = 5.0
 NUM_CLIENTS       = 100
 CLIENTS_PER_ROUND = 20
-NUM_ROUNDS        = 80     # tổng số rounds (bao gồm pretrain)
-PRETRAIN_ROUNDS   = 10     # rounds train sạch trước khi bật attack
+NUM_ROUNDS        = 80
+PRETRAIN_ROUNDS   = 10
 SEED              = 42
 
-# Trust config — quay về gần gốc, đã hoạt động
-ALPHA         = 0.9    # memory cao → trust thay đổi chậm → ổn định
-TAU           = 0.3    # threshold thấp → benign dễ pass
-INITIAL_TRUST = 1.0    # start với max trust
+ALPHA         = 0.9
+TAU           = 0.3
+INITIAL_TRUST = 1.0
 IDLE_DECAY    = 0.002
 WINDOW_SIZE   = 10
 SIM_WEIGHT    = 0.7
-WARMUP_ROUNDS = 0      # không cần warmup vì đã pretrain
+WARMUP_ROUNDS = 0
 
-# Norm penalty — calibrated từ diagnostic
-NORM_PENALTY_THRESHOLD  = 3.0   # bắt đầu penalty ở 3x benign median
+NORM_PENALTY_THRESHOLD  = 3.0
 NORM_PENALTY_STRENGTH   = 0.80
-ABSOLUTE_NORM_THRESHOLD = 15.0  # benign~4.2, attacker~40
+ABSOLUTE_NORM_THRESHOLD = 15.0
 
-# Norm clip
-ENABLE_NORM_CLIP       = True
-CLIP_MULTIPLIER        = 2.0    # 4.23*2=8.46 → attacker 40→8.46
+ENABLE_NORM_CLIP = True   # giữ clip norm
+CLIP_MULTIPLIER  = 2.0
 
 ATTACK_ORDER = ["no_attack", "static", "delayed", "adaptive", "intermittent", "norm_tuned"]
 
@@ -121,7 +118,7 @@ LINEWIDTHS = {
 # DATA
 # ══════════════════════════════════════════════════════════════════════
 
-def load_data(num_clients: int = NUM_CLIENTS):
+def load_data(num_clients=NUM_CLIENTS):
     base_path = os.path.dirname(os.path.abspath(__file__))
     data_path = os.path.join(base_path, '..', 'data')
     transform = transforms.Compose([
@@ -132,7 +129,7 @@ def load_data(num_clients: int = NUM_CLIENTS):
     test_ds  = datasets.MNIST(data_path, train=False, download=True, transform=transform)
     spc = len(train_ds) // num_clients
     client_datasets = [
-        DataLoader(Subset(train_ds, list(range(i * spc, (i + 1) * spc))),
+        DataLoader(Subset(train_ds, list(range(i*spc, (i+1)*spc))),
                    batch_size=32, shuffle=True)
         for i in range(num_clients)
     ]
@@ -162,15 +159,14 @@ class Attacker:
         self.dormant_since      = -1
         self._benign_norm       = 4.23
 
-    def should_attack(self, round_num: int, est_trust: float = 1.0) -> bool:
-        # round_num tính từ 0 nhưng delay tính từ sau pretrain
+    def should_attack(self, round_num, est_trust=1.0):
         effective_round = round_num - PRETRAIN_ROUNDS
-        if self.attack_type == "no_attack":      return False
-        elif self.attack_type == "static":        return True
-        elif self.attack_type == "delayed":       return effective_round >= self.delay_rounds
-        elif self.attack_type == "adaptive":      return self._adaptive(round_num, est_trust)
-        elif self.attack_type == "intermittent":  return np.random.random() < self.attack_probability
-        elif self.attack_type == "norm_tuned":    return True
+        if self.attack_type == "no_attack":     return False
+        elif self.attack_type == "static":      return True
+        elif self.attack_type == "delayed":     return effective_round >= self.delay_rounds
+        elif self.attack_type == "adaptive":    return self._adaptive(round_num, est_trust)
+        elif self.attack_type == "intermittent":return np.random.random() < self.attack_probability
+        elif self.attack_type == "norm_tuned":  return True
         return True
 
     def _adaptive(self, round_num, trust):
@@ -209,10 +205,6 @@ class Attacker:
         return poisoned
 
 
-def _norm(update):
-    return float(np.sqrt(sum(torch.norm(v).item()**2 for v in update.values())))
-
-
 def evaluate(model, test_loader):
     model.eval()
     correct, total, loss_sum = 0, 0, 0.0
@@ -227,7 +219,7 @@ def evaluate(model, test_loader):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SCENARIO RUNNER — v8: pretrain + defense
+# SCENARIO RUNNER — v9: track trust metrics chi tiết
 # ══════════════════════════════════════════════════════════════════════
 
 def run_scenario(attack_type, client_datasets, test_loader,
@@ -270,11 +262,24 @@ def run_scenario(attack_type, client_datasets, test_loader,
         for i in range(NUM_CLIENTS)
     ]
     attackers = {cid: Attacker(cid, attack_type=attack_type) for cid in malicious_ids}
+    benign_ids = [c for c in range(NUM_CLIENTS) if c not in malicious_ids]
 
     history = {
-        'accuracy': [], 'loss': [],
-        'trust_benign': [], 'trust_malicious': [],
-        'attack_rate_actual': [], 'clients_filtered': [],
+        'accuracy':             [],
+        'loss':                 [],
+        # Trust metrics — primary
+        'trust_benign_mean':    [],   # mean trust của benign clients
+        'trust_malicious_mean': [],   # mean trust của malicious clients
+        'trust_benign_std':     [],   # std trust benign
+        'trust_malicious_std':  [],   # std trust malicious
+        'trust_separation':     [],   # benign_mean - malicious_mean
+        'detection_rate':       [],   # % malicious dưới tau (= bị detect)
+        'false_positive_rate':  [],   # % benign dưới tau (= bị filter oan)
+        'clients_filtered':     [],   # số clients bị filter mỗi round
+        # Per-client trust snapshot mỗi 10 rounds (cho violin plot)
+        'benign_trust_snapshots':    {},  # {round: [trust scores]}
+        'malicious_trust_snapshots': {},
+        'attack_rate_actual':   [],
     }
 
     for round_num in tqdm(range(num_rounds),
@@ -297,7 +302,6 @@ def run_scenario(attack_type, client_datasets, test_loader,
             client_ids.append(cid)
             raw_update, real_metrics = client.train()
 
-            # Chỉ attack sau pretrain
             if not is_pretrain and client.is_malicious and cid in attackers:
                 est_trust = trust_manager.get_trust_score(cid)
                 if attackers[cid].should_attack(round_num, est_trust):
@@ -315,22 +319,20 @@ def run_scenario(attack_type, client_datasets, test_loader,
         history['attack_rate_actual'].append(attacks_this_round / CLIENTS_PER_ROUND)
 
         if is_pretrain:
-            # Pretrain: FedAvg thuần, không trust, không attack
             agg = fedavg.aggregate(updates, client_ids, metrics_list)
-            # Update trust với benign updates để warm up norm_history
-            benign_ups = [updates[i] for i,cid in enumerate(client_ids)
-                          if cid not in malicious_ids]
-            if benign_ups:
-                ref = {k: torch.mean(torch.stack([u[k] for u in benign_ups]),dim=0)
-                       for k in benign_ups[0]}
+            # Warm up trust với benign
+            benign_ups_pre = [updates[i] for i,cid in enumerate(client_ids)
+                              if cid not in malicious_ids]
+            if benign_ups_pre:
+                ref = {k: torch.mean(torch.stack([u[k] for u in benign_ups_pre]),dim=0)
+                       for k in benign_ups_pre[0]}
                 for i, cid in enumerate(client_ids):
                     if cid not in malicious_ids:
                         trust_manager.update_trust(cid, updates[i], ref,
                                                    metrics_list[i], round_num)
             history['clients_filtered'].append(0)
         else:
-            # Attack phase: trust-aware aggregation
-            # Reference: mean of benign (known in research mode)
+            # Reference sạch từ benign clients được chọn
             benign_sel = [cid for cid in client_ids if cid not in malicious_ids]
             if benign_sel:
                 benign_ups = [updates[i] for i,cid in enumerate(client_ids)
@@ -338,7 +340,6 @@ def run_scenario(attack_type, client_datasets, test_loader,
                 ref = {k: torch.mean(torch.stack([u[k] for u in benign_ups]),dim=0)
                        for k in benign_ups[0]}
             else:
-                # Fallback: median of all
                 ref = {k: torch.median(torch.stack([u[k] for u in updates]),dim=0).values
                        for k in updates[0]}
 
@@ -357,12 +358,32 @@ def run_scenario(attack_type, client_datasets, test_loader,
             for name, param in model.named_parameters():
                 param.data += agg[name]
 
-        # Trust stats
-        b_trust = [trust_manager.get_trust_score(c)
-                   for c in range(NUM_CLIENTS) if c not in malicious_ids]
-        m_trust = [trust_manager.get_trust_score(c) for c in malicious_ids]
-        history['trust_benign'].append(float(np.mean(b_trust)))
-        history['trust_malicious'].append(float(np.mean(m_trust)))
+        # ── Trust metrics (toàn bộ 100 clients) ──────────────────────
+        b_scores = [trust_manager.get_trust_score(c) for c in benign_ids]
+        m_scores = [trust_manager.get_trust_score(c) for c in malicious_ids]
+
+        b_mean = float(np.mean(b_scores))
+        m_mean = float(np.mean(m_scores))
+        b_std  = float(np.std(b_scores))
+        m_std  = float(np.std(m_scores))
+
+        # Detection rate: % malicious có trust < TAU
+        det_rate = sum(1 for t in m_scores if t < TAU) / len(m_scores)
+        # False positive: % benign có trust < TAU (bị filter oan)
+        fp_rate  = sum(1 for t in b_scores if t < TAU) / len(b_scores)
+
+        history['trust_benign_mean'].append(b_mean)
+        history['trust_malicious_mean'].append(m_mean)
+        history['trust_benign_std'].append(b_std)
+        history['trust_malicious_std'].append(m_std)
+        history['trust_separation'].append(b_mean - m_mean)
+        history['detection_rate'].append(det_rate)
+        history['false_positive_rate'].append(fp_rate)
+
+        # Snapshot mỗi 10 rounds cho violin/box plot
+        if round_num % 10 == 0 or round_num == num_rounds - 1:
+            history['benign_trust_snapshots'][round_num]    = b_scores.copy()
+            history['malicious_trust_snapshots'][round_num] = m_scores.copy()
 
         acc, loss = evaluate(model, test_loader)
         history['accuracy'].append(acc)
@@ -370,21 +391,18 @@ def run_scenario(attack_type, client_datasets, test_loader,
 
         # Debug
         if round_num < PRETRAIN_ROUNDS + 3 or round_num % 10 == 0:
-            tb   = history['trust_benign'][-1]
-            tm   = history['trust_malicious'][-1]
+            tag = "[PRE]" if is_pretrain else "     "
             filt = history['clients_filtered'][-1]
-            tag  = "[PRE]" if is_pretrain else "     "
-            stats = trust_manager.get_statistics()
             print(f"  [r{round_num:02d}]{tag} acc={acc*100:.1f}%  "
-                  f"B={tb:.3f}  M={tm:.3f}  sep={tb-tm:.3f}  "
-                  f"filt={filt:.1f}  trusted={stats['num_trusted']}/{NUM_CLIENTS}  "
-                  f"norm_hist={len(trust_manager._norm_history)}")
+                  f"B={b_mean:.3f}±{b_std:.3f}  M={m_mean:.3f}±{m_std:.3f}  "
+                  f"sep={b_mean-m_mean:.3f}  det={det_rate*100:.0f}%  "
+                  f"fp={fp_rate*100:.0f}%  filt={filt:.1f}")
 
     return history
 
 
 # ══════════════════════════════════════════════════════════════════════
-# METRICS + PLOTS
+# METRICS
 # ══════════════════════════════════════════════════════════════════════
 
 def compute_asr(clean_acc, poisoned_acc, baseline=0.1):
@@ -393,13 +411,322 @@ def compute_asr(clean_acc, poisoned_acc, baseline=0.1):
 
 
 def _config_str():
-    return (f"alpha={ALPHA}, tau={TAU}, pretrain={PRETRAIN_ROUNDS}r, "
-            f"clip={CLIP_MULTIPLIER}x, abs={ABSOLUTE_NORM_THRESHOLD}, "
-            f"pen={NORM_PENALTY_THRESHOLD}x/{NORM_PENALTY_STRENGTH}")
+    return (f"α={ALPHA}, τ={TAU}, pretrain={PRETRAIN_ROUNDS}r, "
+            f"clip={CLIP_MULTIPLIER}x, n={NUM_CLIENTS}, "
+            f"attack_rate={ATTACK_RATE*100:.0f}%")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PLOTS — Trust-focused
+# ══════════════════════════════════════════════════════════════════════
+
+def plot_trust_separation(results, save_dir):
+    """
+    PRIMARY PLOT 1: Trust separation over time cho tất cả attack types.
+    Cho thấy trust mechanism phân biệt được benign vs malicious.
+    """
+    attacks = [a for a in ATTACK_ORDER if a != 'no_attack' and a in results]
+    ncols = 3; nrows = (len(attacks) + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(15, 4.5*nrows),
+                              sharex=True, sharey=True)
+    axes_flat = axes.flatten() if nrows > 1 else list(axes)
+    rounds = np.arange(NUM_ROUNDS)
+
+    for i, attack in enumerate(attacks):
+        ax = axes_flat[i]
+        h  = results[attack]
+
+        b_mean = np.array(h['trust_benign_mean'])
+        m_mean = np.array(h['trust_malicious_mean'])
+        b_std  = np.array(h['trust_benign_std'])
+        m_std  = np.array(h['trust_malicious_std'])
+
+        # Vẽ mean ± std
+        ax.plot(rounds, b_mean, color='#2980b9', linewidth=2.2, label='Benign (mean)')
+        ax.fill_between(rounds, b_mean - b_std, b_mean + b_std,
+                        alpha=0.18, color='#2980b9')
+
+        ax.plot(rounds, m_mean, color='#e74c3c', linewidth=2.2,
+                linestyle='--', label='Malicious (mean)')
+        ax.fill_between(rounds, m_mean - m_std, m_mean + m_std,
+                        alpha=0.18, color='#e74c3c')
+
+        # Tau threshold
+        ax.axhline(y=TAU, color='#888', linestyle=':', linewidth=1.5,
+                   label=f'τ={TAU} (filter threshold)')
+        # Pretrain boundary
+        ax.axvline(x=PRETRAIN_ROUNDS, color='orange', linestyle='--',
+                   linewidth=1.2, alpha=0.8, label='Attack starts')
+
+        # Shade separation area
+        ax.fill_between(rounds, m_mean, b_mean,
+                        where=(b_mean > m_mean),
+                        alpha=0.08, color='#27ae60', label='Separation gap')
+
+        # Final separation annotation
+        final_sep = b_mean[-1] - m_mean[-1]
+        final_det = h['detection_rate'][-1] * 100
+        ax.text(0.97, 0.05,
+                f'sep={final_sep:.3f}\ndet={final_det:.0f}%',
+                transform=ax.transAxes, ha='right', va='bottom',
+                fontsize=9, color='#2c3e50',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                          alpha=0.8, edgecolor='#bdc3c7'))
+
+        ax.set_title(ATTACK_DISPLAY[attack], fontsize=13, fontweight='bold',
+                     color=PALETTE[attack])
+        ax.set_ylim([-0.05, 1.08])
+        ax.grid(True, alpha=0.2)
+        if i % ncols == 0:   ax.set_ylabel('Trust Score', fontsize=11)
+        if i >= (nrows-1)*ncols: ax.set_xlabel('Round', fontsize=11)
+        if i == 0:           ax.legend(fontsize=8.5, loc='upper right')
+
+    for j in range(i+1, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle(
+        f'Trust Score Evolution — Benign vs Malicious Clients\n'
+        f'({_config_str()})  Shaded = ±1 std dev',
+        fontsize=13, fontweight='bold', y=1.01
+    )
+    fig.tight_layout()
+    path = os.path.join(save_dir, 'exp_newmethod_trust_separation.png')
+    fig.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✓ {path}")
+
+
+def plot_detection_rate(results, save_dir):
+    """
+    PRIMARY PLOT 2: Detection rate + False positive rate over time.
+    Cho thấy trust mechanism detect được attacker mà không filter nhầm benign.
+    """
+    attacks = [a for a in ATTACK_ORDER if a != 'no_attack' and a in results]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    rounds = np.arange(NUM_ROUNDS)
+
+    # Detection rate
+    for attack in attacks:
+        h = results[attack]
+        axes[0].plot(rounds, [d*100 for d in h['detection_rate']],
+                     label=ATTACK_DISPLAY[attack],
+                     color=PALETTE[attack],
+                     linestyle=LINESTYLES[attack],
+                     linewidth=LINEWIDTHS[attack])
+
+    axes[0].axvline(x=PRETRAIN_ROUNDS, color='orange', linestyle='--',
+                    linewidth=1.2, alpha=0.8, label='Attack starts')
+    axes[0].axhline(y=100, color='#27ae60', linestyle=':', linewidth=1.0, alpha=0.5)
+    axes[0].set_xlabel('Round', fontsize=12)
+    axes[0].set_ylabel('Detection Rate (%)', fontsize=12)
+    axes[0].set_title('Malicious Client Detection Rate\n(% malicious clients with trust < τ)',
+                      fontsize=12, fontweight='bold')
+    axes[0].set_ylim([-5, 108])
+    axes[0].set_xlim([0, NUM_ROUNDS-1])
+    axes[0].legend(fontsize=9, loc='upper left')
+    axes[0].grid(True, alpha=0.2)
+
+    # False positive rate
+    for attack in attacks:
+        h = results[attack]
+        axes[1].plot(rounds, [f*100 for f in h['false_positive_rate']],
+                     label=ATTACK_DISPLAY[attack],
+                     color=PALETTE[attack],
+                     linestyle=LINESTYLES[attack],
+                     linewidth=LINEWIDTHS[attack])
+
+    axes[1].axvline(x=PRETRAIN_ROUNDS, color='orange', linestyle='--',
+                    linewidth=1.2, alpha=0.8, label='Attack starts')
+    axes[1].axhline(y=0, color='#27ae60', linestyle=':', linewidth=1.0, alpha=0.5)
+    axes[1].set_xlabel('Round', fontsize=12)
+    axes[1].set_ylabel('False Positive Rate (%)', fontsize=12)
+    axes[1].set_title('False Positive Rate\n(% benign clients incorrectly filtered)',
+                      fontsize=12, fontweight='bold')
+    axes[1].set_ylim([-2, 30])
+    axes[1].set_xlim([0, NUM_ROUNDS-1])
+    axes[1].legend(fontsize=9, loc='upper right')
+    axes[1].grid(True, alpha=0.2)
+
+    fig.suptitle(
+        f'Detection Performance — Trust-Aware Defense\n({_config_str()})',
+        fontsize=13, fontweight='bold'
+    )
+    fig.tight_layout()
+    path = os.path.join(save_dir, 'exp_newmethod_detection.png')
+    fig.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✓ {path}")
+
+
+def plot_trust_heatmap(results, save_dir):
+    """
+    PRIMARY PLOT 3: Heatmap final trust scores + separation summary.
+    """
+    attacks = [a for a in ATTACK_ORDER if a in results]
+    fb  = [results[a]['trust_benign_mean'][-1]    for a in attacks]
+    fm  = [results[a]['trust_malicious_mean'][-1] for a in attacks]
+    sep = [b - m for b, m in zip(fb, fm)]
+    det = [results[a]['detection_rate'][-1]*100   for a in attacks]
+    fp  = [results[a]['false_positive_rate'][-1]*100 for a in attacks]
+
+    data = np.array([fb, fm])
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5),
+                             gridspec_kw={'width_ratios': [3, 1.2, 1.2]})
+
+    # Heatmap
+    im = sns.heatmap(
+        data, ax=axes[0],
+        xticklabels=[ATTACK_DISPLAY[a] for a in attacks],
+        yticklabels=['Benign', 'Malicious'],
+        annot=True, fmt='.3f', cmap='RdYlGn', vmin=0, vmax=1,
+        cbar_kws={'label': 'Final Trust Score'},
+        linewidths=1.5, annot_kws={'size': 14, 'weight': 'bold'},
+    )
+    axes[0].set_title(
+        f'Final Trust Score — Benign vs Malicious\n'
+        f'α={ALPHA}, τ={TAU}, attack_rate={ATTACK_RATE*100:.0f}%',
+        fontsize=12, fontweight='bold'
+    )
+    axes[0].axhline(y=1, color='white', linewidth=3)
+    axes[0].tick_params(axis='x', rotation=15)
+
+    # Trust separation bar
+    colors_sep = ['#27ae60' if s > 0.4 else '#e67e22' if s > 0.2 else '#e74c3c'
+                  for s in sep]
+    bars = axes[1].barh(
+        [ATTACK_DISPLAY[a] for a in attacks], sep,
+        color=colors_sep, edgecolor='#444', linewidth=0.8, alpha=0.88
+    )
+    for bar, val in zip(bars, sep):
+        axes[1].text(val + 0.01, bar.get_y() + bar.get_height()/2,
+                     f'{val:.3f}', va='center', fontsize=10, fontweight='bold')
+    axes[1].axvline(x=0.3, color='gray', linestyle='--', linewidth=1.2,
+                    alpha=0.7, label='Good (≥0.3)')
+    axes[1].set_xlabel('Trust Separation\n(Benign − Malicious)', fontsize=10)
+    axes[1].set_title('Separation', fontsize=12, fontweight='bold')
+    axes[1].set_xlim([0, 1.0])
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.2, axis='x')
+
+    # Detection rate bar
+    colors_det = ['#27ae60' if d > 80 else '#e67e22' if d > 50 else '#e74c3c'
+                  for d in det]
+    bars2 = axes[2].barh(
+        [ATTACK_DISPLAY[a] for a in attacks], det,
+        color=colors_det, edgecolor='#444', linewidth=0.8, alpha=0.88
+    )
+    for bar, val, fval in zip(bars2, det, fp):
+        axes[2].text(val + 0.5, bar.get_y() + bar.get_height()/2,
+                     f'{val:.0f}%\n(FP:{fval:.0f}%)',
+                     va='center', fontsize=8.5, fontweight='bold')
+    axes[2].axvline(x=80, color='gray', linestyle='--', linewidth=1.2,
+                    alpha=0.7, label='Good (≥80%)')
+    axes[2].set_xlabel('Detection Rate (%)', fontsize=10)
+    axes[2].set_title('Detection Rate\n(FP = false positive)', fontsize=12, fontweight='bold')
+    axes[2].set_xlim([0, 115])
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.2, axis='x')
+
+    fig.suptitle(
+        f'Trust-Aware Defense — Final State Summary\n({_config_str()})',
+        fontsize=13, fontweight='bold'
+    )
+    fig.tight_layout()
+    path = os.path.join(save_dir, 'exp_newmethod_heatmap.png')
+    fig.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✓ {path}")
+
+
+def plot_trust_distribution(results, save_dir):
+    """
+    PRIMARY PLOT 4: Box plot trust distribution tại các mốc thời gian.
+    Cho thấy sự phân tách rõ ràng giữa benign và malicious theo thời gian.
+    """
+    attacks = [a for a in ATTACK_ORDER if a != 'no_attack' and a in results]
+    snapshot_rounds = sorted(results[attacks[0]]['benign_trust_snapshots'].keys())
+
+    fig, axes = plt.subplots(1, len(attacks), figsize=(3.5*len(attacks), 6),
+                             sharey=True)
+    if len(attacks) == 1:
+        axes = [axes]
+
+    for ax, attack in zip(axes, attacks):
+        rounds_to_show = [r for r in snapshot_rounds if r >= PRETRAIN_ROUNDS]
+        if not rounds_to_show:
+            rounds_to_show = snapshot_rounds
+
+        positions_b = []
+        positions_m = []
+        data_b      = []
+        data_m      = []
+        xticks      = []
+        xlabels     = []
+
+        for idx, r in enumerate(rounds_to_show):
+            b_data = results[attack]['benign_trust_snapshots'].get(r, [])
+            m_data = results[attack]['malicious_trust_snapshots'].get(r, [])
+            if b_data and m_data:
+                pos = idx * 3
+                positions_b.append(pos)
+                positions_m.append(pos + 1)
+                data_b.append(b_data)
+                data_m.append(m_data)
+                xticks.append(pos + 0.5)
+                xlabels.append(f'r{r}')
+
+        if data_b:
+            bp1 = ax.boxplot(data_b, positions=positions_b, widths=0.7,
+                             patch_artist=True, notch=False,
+                             boxprops=dict(facecolor='#aed6f1', alpha=0.8),
+                             medianprops=dict(color='#1a5276', linewidth=2),
+                             whiskerprops=dict(color='#2980b9'),
+                             capprops=dict(color='#2980b9'),
+                             flierprops=dict(marker='o', markersize=3,
+                                            markerfacecolor='#2980b9', alpha=0.5))
+            bp2 = ax.boxplot(data_m, positions=positions_m, widths=0.7,
+                             patch_artist=True, notch=False,
+                             boxprops=dict(facecolor='#f1948a', alpha=0.8),
+                             medianprops=dict(color='#922b21', linewidth=2),
+                             whiskerprops=dict(color='#e74c3c'),
+                             capprops=dict(color='#e74c3c'),
+                             flierprops=dict(marker='o', markersize=3,
+                                            markerfacecolor='#e74c3c', alpha=0.5))
+
+        ax.axhline(y=TAU, color='#888', linestyle='--', linewidth=1.5,
+                   label=f'τ={TAU}')
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(xlabels, fontsize=8, rotation=30)
+        ax.set_title(ATTACK_DISPLAY[attack], fontsize=11, fontweight='bold',
+                     color=PALETTE[attack])
+        ax.set_ylim([-0.05, 1.1])
+        ax.grid(True, alpha=0.2, axis='y')
+        if ax == axes[0]:
+            ax.set_ylabel('Trust Score', fontsize=11)
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor='#aed6f1', label='Benign'),
+                Patch(facecolor='#f1948a', label='Malicious'),
+            ]
+            ax.legend(handles=legend_elements, fontsize=9, loc='lower right')
+
+    fig.suptitle(
+        f'Trust Score Distribution Over Time (Box Plot)\n'
+        f'({_config_str()})  Blue=Benign  Red=Malicious  Dashed=τ',
+        fontsize=12, fontweight='bold'
+    )
+    fig.tight_layout()
+    path = os.path.join(save_dir, 'exp_newmethod_trust_dist.png')
+    fig.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✓ {path}")
 
 
 def plot_accuracy(results, clean_acc, save_dir):
-    fig, ax = plt.subplots(figsize=(12, 6))
+    """SECONDARY PLOT: Accuracy (hệ quả tự nhiên)."""
+    fig, ax = plt.subplots(figsize=(12, 5))
     for attack in ATTACK_ORDER:
         if attack not in results: continue
         acc = results[attack]['accuracy']
@@ -407,13 +734,12 @@ def plot_accuracy(results, clean_acc, save_dir):
                 color=PALETTE[attack], linestyle=LINESTYLES[attack],
                 linewidth=LINEWIDTHS[attack])
     ax.axvline(x=PRETRAIN_ROUNDS, color='gray', linestyle='--',
-               linewidth=1.0, alpha=0.7, label=f'attack starts (r{PRETRAIN_ROUNDS})')
-    ax.axhline(y=TAU, color='gray', linestyle=':', linewidth=1.0, alpha=0.4)
-    ax.set_xlabel('Round', fontsize=13); ax.set_ylabel('Test Accuracy', fontsize=13)
-    ax.set_ylim([0, 1.08]); ax.set_xlim([0, NUM_ROUNDS - 1])
+               linewidth=1.0, alpha=0.7, label=f'Attack starts (r{PRETRAIN_ROUNDS})')
+    ax.set_xlabel('Round', fontsize=12); ax.set_ylabel('Test Accuracy', fontsize=12)
+    ax.set_ylim([0.5, 1.02]); ax.set_xlim([0, NUM_ROUNDS-1])
     ax.grid(True, alpha=0.2)
-    ax.set_title(f"TrustAware v8 — Accuracy\n({_config_str()})",
-                 fontsize=9, fontweight='bold', pad=10)
+    ax.set_title(f'Test Accuracy (secondary metric — hệ quả của trust defense)\n({_config_str()})',
+                 fontsize=10, fontweight='bold', pad=10)
     ax.legend(fontsize=9, loc='lower right', framealpha=0.92)
     fig.tight_layout()
     path = os.path.join(save_dir, 'exp_newmethod_accuracy.png')
@@ -421,124 +747,120 @@ def plot_accuracy(results, clean_acc, save_dir):
     print(f"  ✓ {path}")
 
 
-def plot_asr(results, clean_acc, save_dir):
-    attacks  = [a for a in ATTACK_ORDER if a != 'no_attack' and a in results]
-    asrs     = [compute_asr(clean_acc, results[a]['accuracy'][-1])*100 for a in attacks]
-    fin_accs = [results[a]['accuracy'][-1]*100 for a in attacks]
-    colors   = [PALETTE[a] for a in attacks]
-    x, w     = np.arange(len(attacks)), 0.38
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    bars1 = ax.bar(x-w/2, fin_accs, w, label='Final Accuracy (%)',
-                   color=colors, alpha=0.85, edgecolor='#333', linewidth=0.8)
-    bars2 = ax.bar(x+w/2, asrs, w, label='ASR (%)',
-                   color=colors, alpha=0.45, edgecolor='#333', linewidth=0.8, hatch='//')
-    for bar, val in zip(bars1, fin_accs):
-        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.8,
-                f'{val:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
-    for bar, val in zip(bars2, asrs):
-        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.8,
-                f'{val:.1f}%', ha='center', va='bottom',
-                fontsize=9, fontweight='bold', color='#c0392b')
-    ax.axhline(y=clean_acc*100, color='#2ecc71', linestyle='--',
-               linewidth=1.5, alpha=0.7, label=f'No Attack ({clean_acc*100:.1f}%)')
-    ax.set_xticks(x); ax.set_xticklabels([ATTACK_DISPLAY[a] for a in attacks], fontsize=12)
-    ax.set_ylabel('Percentage (%)', fontsize=12); ax.set_ylim([0, 115])
-    ax.grid(True, alpha=0.25, axis='y')
-    ax.set_title(f"TrustAware v8 — ASR & Final Accuracy\n{_config_str()}",
-                 fontsize=10, fontweight='bold', pad=10)
-    ax.legend(fontsize=10, loc='upper right')
-    fig.tight_layout()
-    path = os.path.join(save_dir, 'exp_newmethod_asr.png')
-    fig.savefig(path, dpi=300, bbox_inches='tight'); plt.close(fig)
-    print(f"  ✓ {path}")
-
-
-def plot_heatmap(results, save_dir):
+def plot_summary_table(results, clean_acc, save_dir):
+    """
+    PRIMARY PLOT 5: Summary table dạng heatmap — dễ đưa vào paper.
+    """
     attacks = [a for a in ATTACK_ORDER if a in results]
-    fb = [results[a]['trust_benign'][-1]    for a in attacks]
-    fm = [results[a]['trust_malicious'][-1] for a in attacks]
-    sep = [b-m for b,m in zip(fb,fm)]
-    data = np.array([fb, fm])
+    metrics = ['Final Acc (%)', 'ASR (%)', 'Trust Sep', 'Det Rate (%)', 'FP Rate (%)']
 
-    fig, axes = plt.subplots(1, 2, figsize=(14,4), gridspec_kw={'width_ratios':[3,1]})
-    sns.heatmap(data, ax=axes[0],
-                xticklabels=[ATTACK_DISPLAY[a] for a in attacks],
-                yticklabels=['Benign','Malicious'],
-                annot=True, fmt='.3f', cmap='RdYlGn', vmin=0, vmax=1,
-                cbar_kws={'label':'Final Trust Score'},
-                linewidths=1.0, annot_kws={'size':13,'weight':'bold'})
-    axes[0].set_title(f"Final Trust\nalpha={ALPHA}, tau={TAU}, pretrain={PRETRAIN_ROUNDS}r",
-                      fontsize=11, fontweight='bold')
-    axes[0].axhline(y=1, color='white', linewidth=2)
-    colors_sep = ['#27ae60' if s>0.3 else '#e67e22' if s>0.1 else '#e74c3c' for s in sep]
-    bars = axes[1].barh([ATTACK_DISPLAY[a] for a in attacks], sep,
-                        color=colors_sep, edgecolor='#333', linewidth=0.7, alpha=0.85)
-    for bar, val in zip(bars, sep):
-        axes[1].text(val+0.01, bar.get_y()+bar.get_height()/2,
-                     f'{val:.3f}', va='center', fontsize=9, fontweight='bold')
-    axes[1].axvline(x=0.3, color='gray', linestyle='--', linewidth=1.0, alpha=0.6)
-    axes[1].set_xlabel('Trust Separation', fontsize=10)
-    axes[1].set_title('Separation', fontsize=11, fontweight='bold')
-    axes[1].set_xlim([0,1.0]); axes[1].grid(True, alpha=0.2, axis='x')
+    data = []
+    for attack in attacks:
+        h   = results[attack]
+        acc = h['accuracy'][-1] * 100
+        asr = compute_asr(clean_acc, h['accuracy'][-1]) * 100
+        sep = h['trust_separation'][-1]
+        det = h['detection_rate'][-1] * 100
+        fp  = h['false_positive_rate'][-1] * 100
+        data.append([acc, asr, sep, det, fp])
+
+    data_arr   = np.array(data)
+    row_labels = [ATTACK_DISPLAY[a] for a in attacks]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.axis('off')
+
+    # Normalize per column for coloring
+    col_colors = []
+    for col_idx, metric in enumerate(metrics):
+        col = data_arr[:, col_idx]
+        norm_col = (col - col.min()) / (col.max() - col.min() + 1e-8)
+        # Invert for ASR and FP (lower = better)
+        if metric in ['ASR (%)', 'FP Rate (%)']:
+            norm_col = 1 - norm_col
+        col_colors.append(norm_col)
+
+    cell_colors = []
+    for row_idx in range(len(attacks)):
+        row_c = []
+        for col_idx in range(len(metrics)):
+            v = col_colors[col_idx][row_idx]
+            # Green→Red colormap
+            r = 1 - v * 0.6
+            g = 0.3 + v * 0.6
+            b = 0.3
+            row_c.append((r, g, b, 0.7))
+        cell_colors.append(row_c)
+
+    cell_text = []
+    for row in data:
+        cell_text.append([
+            f'{row[0]:.2f}%',
+            f'{row[1]:.2f}%',
+            f'{row[2]:.3f}',
+            f'{row[3]:.1f}%',
+            f'{row[4]:.1f}%',
+        ])
+
+    tbl = ax.table(
+        cellText=cell_text,
+        rowLabels=row_labels,
+        colLabels=metrics,
+        cellColours=cell_colors,
+        rowColours=[(*[0.9, 0.9, 0.9], 0.8)] * len(attacks),
+        colColours=[(*[0.3, 0.3, 0.6], 0.8)] * len(metrics),
+        cellLoc='center', loc='center'
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1.3, 2.0)
+
+    # Header text color white
+    for (row, col), cell in tbl.get_celld().items():
+        if row == 0:
+            cell.get_text().set_color('white')
+            cell.get_text().set_fontweight('bold')
+
+    ax.set_title(
+        f'Trust-Aware Defense — Summary Metrics\n({_config_str()})',
+        fontsize=13, fontweight='bold', pad=20
+    )
     fig.tight_layout()
-    path = os.path.join(save_dir, 'exp_newmethod_heatmap.png')
-    fig.savefig(path, dpi=300, bbox_inches='tight'); plt.close(fig)
+    path = os.path.join(save_dir, 'exp_newmethod_summary_table.png')
+    fig.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
     print(f"  ✓ {path}")
 
 
-def plot_trust_evolution(results, save_dir):
-    attacks_to_plot = [a for a in ATTACK_ORDER if a != 'no_attack' and a in results]
-    ncols = 3; nrows = (len(attacks_to_plot)+ncols-1)//ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(14,4*nrows), sharex=True, sharey=True)
-    axes_flat = axes.flatten() if nrows > 1 else list(axes)
-    rounds = np.arange(NUM_ROUNDS)
-    for i, attack in enumerate(attacks_to_plot):
-        ax = axes_flat[i]
-        tb = results[attack]['trust_benign']
-        tm = results[attack]['trust_malicious']
-        ax.plot(rounds, tb, color='#2980b9', linewidth=2.0, label='Benign avg')
-        ax.plot(rounds, tm, color='#e74c3c', linewidth=2.0, linestyle='--', label='Malicious avg')
-        ax.fill_between(rounds, tm, tb, alpha=0.12, color='#27ae60')
-        ax.axhline(y=TAU, color='gray', linestyle=':', linewidth=1.2, alpha=0.7, label=f'tau={TAU}')
-        ax.axvline(x=PRETRAIN_ROUNDS, color='orange', linestyle='--',
-                   linewidth=1.0, alpha=0.8, label='attack start')
-        ax.set_title(ATTACK_DISPLAY[attack], fontsize=12, fontweight='bold', color=PALETTE[attack])
-        ax.set_ylim([0,1.05]); ax.grid(True, alpha=0.2)
-        if i % ncols == 0: ax.set_ylabel('Trust Score', fontsize=10)
-        if i >= (nrows-1)*ncols: ax.set_xlabel('Round', fontsize=10)
-        if i == 0: ax.legend(fontsize=8, loc='center right')
-    for j in range(i+1, len(axes_flat)):
-        axes_flat[j].set_visible(False)
-    fig.suptitle(f"Trust Evolution — v8 (pretrain={PRETRAIN_ROUNDS}r)\n"
-                 f"alpha={ALPHA}, tau={TAU}, abs_thresh={ABSOLUTE_NORM_THRESHOLD}",
-                 fontsize=11, fontweight='bold', y=1.01)
-    fig.tight_layout()
-    path = os.path.join(save_dir, 'exp_newmethod_trust.png')
-    fig.savefig(path, dpi=300, bbox_inches='tight'); plt.close(fig)
-    print(f"  ✓ {path}")
-
+# ══════════════════════════════════════════════════════════════════════
+# CONSOLE SUMMARY
+# ══════════════════════════════════════════════════════════════════════
 
 def print_summary(results, clean_acc):
-    print("\n" + "="*85)
-    print(f"  TRUST-AWARE DEFENSE v8 — SUMMARY")
-    print(f"  {_config_str()}")
+    print("\n" + "="*95)
+    print(f"  TRUST-AWARE DEFENSE v9 — SUMMARY  ({_config_str()})")
     print(f"  Clean baseline: {clean_acc*100:.2f}%")
-    print("="*85)
-    print(f"  {'Attack':<16} {'Final Acc':>11} {'ASR':>9} {'TrustSep':>10} {'B_trust':>9} {'M_trust':>10}")
-    print("  "+"-"*75)
+    print("="*95)
+    print(f"  {'Attack':<14} {'Acc':>8} {'ASR':>8} {'TrustSep':>10} "
+          f"{'DetRate':>9} {'FP Rate':>9} {'B_trust':>9} {'M_trust':>9}")
+    print("  " + "-"*90)
     for attack in ATTACK_ORDER:
         if attack not in results: continue
-        acc = results[attack]['accuracy'][-1]
-        asr = compute_asr(clean_acc, acc)*100
-        tb  = results[attack]['trust_benign'][-1]
-        tm  = results[attack]['trust_malicious'][-1]
-        sep = tb-tm
-        sf  = "✓" if sep>0.3 else ("~" if sep>0.1 else "✗")
-        af  = "✓" if asr<20 else ("~" if asr<50 else "✗")
-        print(f"  {ATTACK_DISPLAY[attack]:<16} {acc*100:>10.2f}% "
-              f"{asr:>8.2f}% {sep:>10.3f}{sf} {tb:>8.3f}  {tm:>9.3f}  {af}")
-    print("="*85)
+        h   = results[attack]
+        acc = h['accuracy'][-1]
+        asr = compute_asr(clean_acc, acc) * 100
+        sep = h['trust_separation'][-1]
+        det = h['detection_rate'][-1] * 100
+        fp  = h['false_positive_rate'][-1] * 100
+        tb  = h['trust_benign_mean'][-1]
+        tm  = h['trust_malicious_mean'][-1]
+        sf  = "✓" if sep > 0.3 else ("~" if sep > 0.1 else "✗")
+        df  = "✓" if det > 80  else ("~" if det > 50  else "✗")
+        print(f"  {ATTACK_DISPLAY[attack]:<14} {acc*100:>7.2f}% "
+              f"{asr:>7.2f}% {sep:>10.3f}{sf} "
+              f"{det:>8.1f}%{df} {fp:>8.1f}%  "
+              f"{tb:>8.3f}  {tm:>8.3f}")
+    print("="*95)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -553,30 +875,34 @@ EXP_MAP = {
 def _setup(save_dir):
     os.makedirs(save_dir, exist_ok=True)
     np.random.seed(SEED); torch.manual_seed(SEED)
-    malicious_ids = set(np.random.choice(NUM_CLIENTS, int(NUM_CLIENTS*ATTACK_RATE), replace=False))
+    malicious_ids = set(np.random.choice(
+        NUM_CLIENTS, int(NUM_CLIENTS*ATTACK_RATE), replace=False))
     print(f"  Malicious ({len(malicious_ids)}): {sorted(malicious_ids)[:10]} ...")
-    print(f"  Pretrain: {PRETRAIN_ROUNDS} rounds (no attack)")
-    print(f"  Attack:   rounds {PRETRAIN_ROUNDS}–{NUM_ROUNDS-1}")
+    print(f"  Pretrain={PRETRAIN_ROUNDS}r  Attack={NUM_ROUNDS-PRETRAIN_ROUNDS}r  "
+          f"clip={'ON' if ENABLE_NORM_CLIP else 'OFF'}")
     print("  Loading MNIST ...")
     return malicious_ids, *load_data()
 
 def run_single_exp(attack, save_dir='results/figures'):
     print("\n"+"="*85)
-    print(f"  TrustAware v8 — Single Run: {attack.upper()}")
+    print(f"  TrustAware v9 — Single Run: {attack.upper()}")
     print(f"  {_config_str()}")
     print("="*85+"\n")
     malicious_ids, client_datasets, test_loader = _setup(save_dir)
     torch.manual_seed(SEED); np.random.seed(SEED)
     history = run_scenario(attack, client_datasets, test_loader,
                            malicious_ids, num_rounds=NUM_ROUNDS)
-    tb=history['trust_benign'][-1]; tm=history['trust_malicious'][-1]
-    print(f"\n  -> Accuracy={history['accuracy'][-1]*100:.2f}%  "
-          f"TrustSep={tb-tm:.3f}  (B={tb:.3f}, M={tm:.3f})")
+    sep = history['trust_separation'][-1]
+    det = history['detection_rate'][-1] * 100
+    tb  = history['trust_benign_mean'][-1]
+    tm  = history['trust_malicious_mean'][-1]
+    print(f"\n  -> Acc={history['accuracy'][-1]*100:.2f}%  "
+          f"Sep={sep:.3f}  Det={det:.0f}%  (B={tb:.3f}, M={tm:.3f})")
     print("="*85)
 
 def run_all(save_dir='results/figures'):
     print("\n"+"="*85)
-    print(f"  TrustAware v8 DEFENSE — Full Run")
+    print(f"  TrustAware v9 — Full Run (all attack types)")
     print(f"  {_config_str()}")
     print("="*85+"\n")
     malicious_ids, client_datasets, test_loader = _setup(save_dir)
@@ -584,31 +910,47 @@ def run_all(save_dir='results/figures'):
     for idx, attack in enumerate(ATTACK_ORDER, 1):
         print(f"\n  [{idx:02d}/{len(ATTACK_ORDER)}]  vs {attack.upper()}")
         torch.manual_seed(SEED); np.random.seed(SEED)
-        results[attack] = run_scenario(attack, client_datasets, test_loader,
-                                       malicious_ids, num_rounds=NUM_ROUNDS)
-        acc=results[attack]['accuracy'][-1]
-        tb=results[attack]['trust_benign'][-1]; tm=results[attack]['trust_malicious'][-1]
-        print(f"         -> Acc={acc*100:.2f}%  Sep={tb-tm:.3f} (B={tb:.3f} M={tm:.3f})")
+        results[attack] = run_scenario(
+            attack, client_datasets, test_loader,
+            malicious_ids, num_rounds=NUM_ROUNDS)
+        h   = results[attack]
+        acc = h['accuracy'][-1]
+        sep = h['trust_separation'][-1]
+        det = h['detection_rate'][-1] * 100
+        print(f"         -> Acc={acc*100:.2f}%  Sep={sep:.3f}  Det={det:.0f}%")
+
     clean_acc = results['no_attack']['accuracy'][-1]
+
     print("\n  Generating figures ...")
+    plot_trust_separation(results, save_dir)
+    plot_detection_rate(results, save_dir)
+    plot_trust_heatmap(results, save_dir)
+    plot_trust_distribution(results, save_dir)
     plot_accuracy(results, clean_acc, save_dir)
-    plot_asr(results, clean_acc, save_dir)
-    plot_heatmap(results, save_dir)
-    plot_trust_evolution(results, save_dir)
+    plot_summary_table(results, clean_acc, save_dir)
+
     print_summary(results, clean_acc)
+    print(f"\n  Figures saved to {save_dir}/")
+    print(f"    - exp_newmethod_trust_separation.png  [PRIMARY]")
+    print(f"    - exp_newmethod_detection.png          [PRIMARY]")
+    print(f"    - exp_newmethod_heatmap.png            [PRIMARY]")
+    print(f"    - exp_newmethod_trust_dist.png         [PRIMARY]")
+    print(f"    - exp_newmethod_summary_table.png      [PRIMARY]")
+    print(f"    - exp_newmethod_accuracy.png           [secondary]")
     print("="*85)
 
 def main():
     import argparse
-    valid = ['all']+list(EXP_MAP.keys())+list(EXP_MAP.values())
-    p = argparse.ArgumentParser()
-    p.add_argument('scenario', nargs='?', default='all', choices=valid, metavar='SCENARIO')
+    valid = ['all'] + list(EXP_MAP.keys()) + list(EXP_MAP.values())
+    p = argparse.ArgumentParser(description='TrustAware v9 — Trust-focused evaluation')
+    p.add_argument('scenario', nargs='?', default='all',
+                   choices=valid, metavar='SCENARIO')
     args = p.parse_args()
     s = args.scenario.lower().strip()
     save_dir = 'results/figures'
-    if s in EXP_MAP:            run_single_exp(EXP_MAP[s], save_dir)
-    elif s in EXP_MAP.values(): run_single_exp(s, save_dir)
-    else:                       run_all(save_dir)
+    if s in EXP_MAP:             run_single_exp(EXP_MAP[s], save_dir)
+    elif s in EXP_MAP.values():  run_single_exp(s, save_dir)
+    else:                        run_all(save_dir)
 
 if __name__ == "__main__":
     main()
