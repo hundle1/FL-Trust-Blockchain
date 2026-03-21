@@ -72,10 +72,20 @@ PRETRAIN_ROUNDS   = 10
 SEED              = 42
 
 ALPHA             = 0.9
-TAU               = 0.3
+TAU               = 0.25          # v8: 0.30→0.25 (adaptive det≥10%)
 INITIAL_TRUST     = 1.0
 IDLE_DECAY        = 0.002
-SIM_WEIGHT        = 0.7
+# v8 signal weights (sim + direction + loss, sum=1 internally)
+SIM_WEIGHT        = 0.55          # cosine similarity
+DIR_WEIGHT        = 0.25          # direction consistency (FIX1: norm-tuned)
+LOSS_WEIGHT       = 0.20          # loss signal
+# v8 temporal smoothing (FIX2: intermittent)
+SMOOTHING_BETA    = 0.7           # weight current vs window mean
+SMOOTHING_WINDOW  = 5
+# v8 sustained penalty (FIX3: adaptive)
+SUSTAINED_THRESH  = 0.45
+SUSTAINED_WINDOW  = 3
+SUSTAINED_STRENGTH = 0.15
 WARMUP_ROUNDS     = 0
 
 ABSOLUTE_NORM_THRESHOLD = 15.0
@@ -191,29 +201,43 @@ def run_scenario(attack_type, client_datasets, test_loader,
     benign_ids = [c for c in range(NUM_CLIENTS) if c not in malicious_ids]
 
     trust_manager = TrustScoreManager(
-        num_clients             = NUM_CLIENTS,
-        alpha                   = ALPHA,
-        tau                     = TAU,
-        initial_trust           = INITIAL_TRUST,
-        enable_decay            = True,
-        decay_strategy          = "exponential",
-        similarity_weight       = SIM_WEIGHT,
-        idle_decay_rate         = IDLE_DECAY,
-        enable_norm_penalty     = True,
-        norm_penalty_threshold  = 3.0,
-        norm_penalty_strength   = 0.80,
-        absolute_norm_threshold = ABSOLUTE_NORM_THRESHOLD,
-        warmup_rounds           = WARMUP_ROUNDS,
+        num_clients              = NUM_CLIENTS,
+        alpha                    = ALPHA,
+        tau                      = TAU,
+        initial_trust            = INITIAL_TRUST,
+        enable_decay             = True,
+        decay_strategy           = "exponential",
+        # v8 signal weights
+        similarity_weight        = SIM_WEIGHT,
+        direction_weight         = DIR_WEIGHT,
+        loss_weight              = LOSS_WEIGHT,
+        # v8 temporal smoothing (intermittent fix)
+        smoothing_beta           = SMOOTHING_BETA,
+        smoothing_window         = SMOOTHING_WINDOW,
+        # v8 idle decay
+        idle_decay_rate          = IDLE_DECAY,
+        # norm penalty
+        enable_norm_penalty      = True,
+        norm_penalty_threshold   = 3.0,
+        norm_penalty_strength    = 0.80,
+        absolute_norm_threshold  = ABSOLUTE_NORM_THRESHOLD,
+        # v8 sustained penalty (adaptive fix)
+        enable_sustained_penalty = True,
+        sustained_threshold      = SUSTAINED_THRESH,
+        sustained_window         = SUSTAINED_WINDOW,
+        sustained_penalty_strength = SUSTAINED_STRENGTH,
+        warmup_rounds            = WARMUP_ROUNDS,
     )
 
     aggregator = TrustAwareAggregator(
         trust_manager,
-        enable_filtering       = True,
-        enable_norm_clip       = ENABLE_NORM_CLIP,
-        clip_multiplier        = CLIP_MULTIPLIER,
-        warmup_clip_multiplier = CLIP_MULTIPLIER,
-        warmup_rounds          = WARMUP_ROUNDS,
-        use_median             = False,
+        enable_filtering        = True,
+        enable_norm_clip        = ENABLE_NORM_CLIP,
+        clip_multiplier         = CLIP_MULTIPLIER,
+        warmup_clip_multiplier  = CLIP_MULTIPLIER,
+        warmup_rounds           = WARMUP_ROUNDS,
+        use_median              = False,
+        fallback_top_k_ratio    = 0.3,   # prevent gaussian collapse
     )
     fedavg = FedAvgAggregator()
 
@@ -419,6 +443,7 @@ def compute_statistical_significance(results: dict) -> dict:
 def _config_str():
     return (f"α={ALPHA}, τ={TAU}, pretrain={PRETRAIN_ROUNDS}r, "
             f"clip={CLIP_MULTIPLIER}x, ref={REFERENCE_MODE}, "
+            f"dir_w={DIR_WEIGHT}, smooth_β={SMOOTHING_BETA}, "
             f"n={NUM_CLIENTS}, attack_rate={ATTACK_RATE*100:.0f}%")
 
 

@@ -54,7 +54,7 @@ PRETRAIN_ROUNDS   = 10    # TrustAware pretrain phase
 SEED              = 42
 
 ALPHA = 0.9
-TAU   = 0.3
+TAU   = 0.25   # v8: calibrated for adaptive det≥10%
 
 # Defenses to compare
 DEFENSE_ORDER = ["fedavg", "krum", "trimmed_mean", "trust_aware"]
@@ -166,15 +166,21 @@ def run_scenario(defense_name, attack_type, client_datasets,
         trust_manager = TrustScoreManager(
             NUM_CLIENTS, alpha=ALPHA, tau=TAU,
             initial_trust=1.0, enable_decay=True,
-            similarity_weight=0.7, idle_decay_rate=0.002,
+            similarity_weight=0.55, direction_weight=0.25, loss_weight=0.20,
+            smoothing_beta=0.7, smoothing_window=5,
+            idle_decay_rate=0.002,
             enable_norm_penalty=True,
             norm_penalty_threshold=3.0, norm_penalty_strength=0.80,
-            absolute_norm_threshold=15.0, warmup_rounds=0,
+            absolute_norm_threshold=15.0,
+            enable_sustained_penalty=True,
+            sustained_threshold=0.45, sustained_window=3,
+            sustained_penalty_strength=0.15,
+            warmup_rounds=0,
         )
         aggregator = TrustAwareAggregator(
             trust_manager, enable_filtering=True,
             enable_norm_clip=True, clip_multiplier=2.0,
-            warmup_rounds=0,
+            warmup_rounds=0, fallback_top_k_ratio=0.3,
         )
     else:  # fedavg
         aggregator = fedavg_agg

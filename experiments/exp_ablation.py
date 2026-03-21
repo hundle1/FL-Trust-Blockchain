@@ -52,7 +52,7 @@ PRETRAIN_ROUNDS   = 10
 SEED              = 42
 
 ALPHA = 0.9
-TAU   = 0.3
+TAU   = 0.25   # v8 calibrated
 ABSOLUTE_NORM_THRESHOLD = 15.0
 CLIP_MULTIPLIER = 2.0
 
@@ -125,15 +125,22 @@ def run_variant(variant_id, attack_type, client_datasets,
     if use_trust:
         trust_manager = TrustScoreManager(
             NUM_CLIENTS, alpha=ALPHA, tau=TAU, initial_trust=1.0,
-            enable_decay=True, similarity_weight=0.7, idle_decay_rate=0.002,
-            enable_norm_penalty=use_clip,  # norm penalty only with clip
+            enable_decay=True,
+            similarity_weight=0.55, direction_weight=0.25, loss_weight=0.20,
+            smoothing_beta=0.7, smoothing_window=5,
+            idle_decay_rate=0.002,
+            enable_norm_penalty=use_clip,
             norm_penalty_threshold=3.0, norm_penalty_strength=0.80,
-            absolute_norm_threshold=ABSOLUTE_NORM_THRESHOLD, warmup_rounds=0,
+            absolute_norm_threshold=ABSOLUTE_NORM_THRESHOLD,
+            enable_sustained_penalty=True,
+            sustained_threshold=0.45, sustained_window=3,
+            sustained_penalty_strength=0.15,
+            warmup_rounds=0,
         )
         aggregator = TrustAwareAggregator(
             trust_manager, enable_filtering=True,
             enable_norm_clip=use_clip, clip_multiplier=CLIP_MULTIPLIER,
-            warmup_rounds=0,
+            warmup_rounds=0, fallback_top_k_ratio=0.3,
         )
     elif use_clip:
         # Clip-only: use FedAvg but with a norm-clipping wrapper
