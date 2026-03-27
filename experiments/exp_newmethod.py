@@ -76,17 +76,19 @@ TAU               = 0.25          # v8: 0.30→0.25 (adaptive det≥10%)
 INITIAL_TRUST     = 1.0
 IDLE_DECAY        = 0.002
 # v8 signal weights (sim + direction + loss, sum=1 internally)
-SIM_WEIGHT        = 0.55          # cosine similarity
-DIR_WEIGHT        = 0.25          # direction consistency (FIX1: norm-tuned)
-LOSS_WEIGHT       = 0.20          # loss signal
+SIM_WEIGHT        = 0.40          # cosine similarity
+DIR_WEIGHT        = 0.30          # direction consistency (FIX1: norm-tuned)
+LOSS_WEIGHT       = 0.15          # loss signal
 # v8 temporal smoothing (FIX2: intermittent)
-SMOOTHING_BETA    = 0.7           # weight current vs window mean
-SMOOTHING_WINDOW  = 5
-# v8 sustained penalty (FIX3: adaptive)
-SUSTAINED_THRESH  = 0.45
-SUSTAINED_WINDOW  = 3
-SUSTAINED_STRENGTH = 0.15
+# SMOOTHING_BETA    = 0.7           # weight current vs window mean
+# SMOOTHING_WINDOW  = 5
+# # v8 sustained penalty (FIX3: adaptive)
+# SUSTAINED_THRESH  = 0.45
+# SUSTAINED_WINDOW  = 3
+# SUSTAINED_STRENGTH = 0.15
 WARMUP_ROUNDS     = 0
+SUSTAINED_THRESH  = 0.45    # giữ nguyên
+SUSTAINED_WINDOW  = 2       # cải thiện phát hiện slow poisoning bằng cách giảm từ 3 → 2 
 
 ABSOLUTE_NORM_THRESHOLD = 15.0
 ENABLE_NORM_CLIP         = True
@@ -203,29 +205,35 @@ def run_scenario(attack_type, client_datasets, test_loader,
     trust_manager = TrustScoreManager(
         num_clients              = NUM_CLIENTS,
         alpha                    = ALPHA,
+        alpha_sudden             = 0.50,
+        alpha_trend              = 0.60,
+        alpha_slow_poison        = 0.50,
         tau                      = TAU,
         initial_trust            = INITIAL_TRUST,
         enable_decay             = True,
-        decay_strategy           = "exponential",
-        # v8 signal weights
-        similarity_weight        = SIM_WEIGHT,
-        direction_weight         = DIR_WEIGHT,
-        loss_weight              = LOSS_WEIGHT,
-        # v8 temporal smoothing (intermittent fix)
-        smoothing_beta           = SMOOTHING_BETA,
-        smoothing_window         = SMOOTHING_WINDOW,
-        # v8 idle decay
-        idle_decay_rate          = IDLE_DECAY,
-        # norm penalty
-        enable_norm_penalty      = True,
-        norm_penalty_threshold   = 3.0,
-        norm_penalty_strength    = 0.80,
-        absolute_norm_threshold  = ABSOLUTE_NORM_THRESHOLD,
-        # v8 sustained penalty (adaptive fix)
-        enable_sustained_penalty = True,
+        min_trust                = 0.05,
+        w_cos                    = 0.40,   
+        w_dir                    = 0.30,    
+        w_loss                   = 0.15,
+        w_norm                   = 0.10,
+        w_sus                    = 0.05,
+        mu_beta                  = 0.9,
+        mu_init                  = 0.5,
+        sigma_init               = 0.15,
+        mad_eps                  = 1e-4,
+        mad_clip                 = 10.0,
+        sudden_drop_threshold    = 0.30,
+        trend_threshold          = -0.07,
+        trend_window             = 3,
+        var_window               = 5,
+        var_mean_delta           = 0.08,
+        var_thresh               = 0.01,
         sustained_threshold      = SUSTAINED_THRESH,
         sustained_window         = SUSTAINED_WINDOW,
-        sustained_penalty_strength = SUSTAINED_STRENGTH,
+        norm_z_tau               = 2.0,
+        norm_z_smooth            = True,
+        absolute_norm_threshold  = ABSOLUTE_NORM_THRESHOLD,
+        idle_decay_rate          = IDLE_DECAY,
         warmup_rounds            = WARMUP_ROUNDS,
     )
 
@@ -234,9 +242,7 @@ def run_scenario(attack_type, client_datasets, test_loader,
         enable_filtering        = True,
         enable_norm_clip        = ENABLE_NORM_CLIP,
         clip_multiplier         = CLIP_MULTIPLIER,
-        warmup_clip_multiplier  = CLIP_MULTIPLIER,
         warmup_rounds           = WARMUP_ROUNDS,
-        use_median              = False,
         fallback_top_k_ratio    = 0.3,   # prevent gaussian collapse
     )
     fedavg = FedAvgAggregator()
@@ -443,7 +449,7 @@ def compute_statistical_significance(results: dict) -> dict:
 def _config_str():
     return (f"α={ALPHA}, τ={TAU}, pretrain={PRETRAIN_ROUNDS}r, "
             f"clip={CLIP_MULTIPLIER}x, ref={REFERENCE_MODE}, "
-            f"dir_w={DIR_WEIGHT}, smooth_β={SMOOTHING_BETA}, "
+            f"dir_w={DIR_WEIGHT},"
             f"n={NUM_CLIENTS}, attack_rate={ATTACK_RATE*100:.0f}%")
 
 
